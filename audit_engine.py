@@ -8,7 +8,42 @@ import hashlib
 from datetime import datetime, date
 from typing import Optional, List, Dict, Tuple, Any
 
-from pdfminer.high_level import extract_text
+import io
+
+_pdfminer_ok = False
+_pypdf_ok = False
+
+try:
+    from pdfminer.high_level import extract_text as _pdfminer_extract_text
+    _pdfminer_ok = True
+except Exception:
+    _pdfminer_ok = False
+
+try:
+    import pypdf
+    def _pypdf_extract_text(pdf_bytes: bytes) -> str:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        out = []
+        for page in reader.pages:
+            out.append(page.extract_text() or "")
+        return "\n".join(out)
+    _pypdf_ok = True
+except Exception:
+    _pypdf_ok = False
+
+def _extract_text_any(pdf_bytes: bytes) -> str:
+    # Try pdfminer first (better), then PyPDF
+    if _pdfminer_ok:
+        try:
+            return _pdfminer_extract_text(io.BytesIO(pdf_bytes))
+        except Exception:
+            pass
+    if _pypdf_ok:
+        try:
+            return _pypdf_extract_text(pdf_bytes)
+        except Exception:
+            pass
+    return ""
 from dateutil.parser import parse as dtparse
 
 # --- add this to audit_engine.py ---
@@ -274,14 +309,18 @@ def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
         if not isinstance(img, Image.Image): img = img.convert("RGB")
         out.append(pytesseract.image_to_string(img, lang="eng"))
     return "\n".join(out)
-
 def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
     notes: List[str] = []
     text = ""
     try:
-        text = extract_text(io.BytesIO(pdf_bytes))
+        text = _extract_text_any(pdf_bytes)
+        if not text.strip():
+            notes.append("No extractable text (may be a scanned PDF).")
     except Exception as e:
-        notes.append(f"pdfminer error: {e}")
+        notes.append(f"PDF text extraction error: {e}")
+        text = ""
+
+    # OCR fallback (works locally / on Hugging Face, not on Streamlit Cloud)
     ocr_used = False
     if len(text.strip()) < 120:
         ocr = _ocr_pdf_to_text(pdf_bytes)
@@ -291,6 +330,7 @@ def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
             notes.append("OCR fallback used (image PDF).")
         else:
             notes.append("OCR not available or yielded too little text.")
+
     ejari = parse_ejari_text(text)
     return {"text": text, "ejari": ejari, "ocr_used": ocr_used, "notes": notes}
 
