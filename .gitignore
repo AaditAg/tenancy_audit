@@ -1,0 +1,26 @@
+cat > .gitignore <<'EOF'
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+
+# Virtual env
+.venv/
+venv/
+
+# Streamlit cache & logs
+.streamlit/cache/
+.streamlit/logs/
+
+# Local secrets (DO NOT COMMIT)
+.streamlit/secrets.toml
+
+# Misc
+*.pdf
+*.html
+EOF
