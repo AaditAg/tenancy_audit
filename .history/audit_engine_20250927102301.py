@@ -1,12 +1,8 @@
 # audit_engine.py
-# ---------------------------------------------------------------------
-# Core audit engine for Dubai tenancy contracts (Ejari-like parsing).
-# - Robust PDF extraction (pdfminer -> PyPDF fallback; optional OCR)
-# - RERA rent-cap slabs (Decree 43/2013)
-# - Rule checks (Law 26/2007, Law 33/2008, Decree 43/2013)
-# - Append-only style Firestore ledger (Admin SDK)
-# - Small helpers used by app.py (to_date, parsers, etc.)
-# ---------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Core audit engine for Dubai tenancy contracts (Ejari-style parsing).
+# Robust PDF extraction, rule checks, RERA index helper, Firestore log.
+# ----------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -21,9 +17,8 @@ from typing import Optional, List, Dict, Tuple, Any
 
 from dateutil.parser import parse as dtparse
 
-# ============================ PDF extraction =============================
-
-# Prefer pdfminer for better layout/text; fallback to PyPDF (no system deps)
+# ----------------------------- PDF Extraction -----------------------------
+# Prefer pdfminer for layout; fallback to PyPDF (no system deps).
 _pdfminer_ok = False
 _pypdf_ok = False
 
@@ -38,7 +33,7 @@ try:
 
     def _pypdf_extract_text(pdf_bytes: bytes) -> str:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        out: List[str] = []
+        out = []
         for page in reader.pages:
             out.append(page.extract_text() or "")
         return "\n".join(out)
@@ -49,7 +44,7 @@ except Exception:
 
 
 def _extract_text_any(pdf_bytes: bytes) -> str:
-    """Try pdfminer first; fallback to PyPDF; return empty string if both fail."""
+    """Try pdfminer first, then PyPDF. Return empty string if both fail."""
     if _pdfminer_ok:
         try:
             return _pdfminer_extract_text(io.BytesIO(pdf_bytes))
@@ -63,18 +58,16 @@ def _extract_text_any(pdf_bytes: bytes) -> str:
     return ""
 
 
+# Optional OCR (works locally; not on Streamlit Cloud)
 def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
-    """
-    Optional OCR fallback (works only when tesseract + poppler are installed).
-    Streamlit Cloud doesn't provide these system packages.
-    """
+    """Attempt OCR (requires poppler + tesseract). Return '' if unavailable."""
     try:
         from pdf2image import convert_from_bytes  # type: ignore
         import pytesseract  # type: ignore
         from PIL import Image  # type: ignore
 
         images = convert_from_bytes(pdf_bytes)
-        texts: List[str] = []
+        texts = []
         for im in images:
             if not isinstance(im, Image.Image):
                 im = im.convert("RGB")
@@ -84,11 +77,11 @@ def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
         return ""
 
 
-# =============================== Utilities ===============================
-
+# ----------------------------- Utilities ---------------------------------
 AED_RE = re.compile(r"(?i)\bAED\s*([0-9][\d,\.]*)")
 INT_RE = re.compile(r"\b\d+\b")
-PCT_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*%")
+PCT_RE = re.compile(r"([-+]?\d+(\.\d+)?)\s*%")
+
 EJARI_CONTACT_RE = re.compile(r"(?i)\b(?:Ejari|EJARI)\s*(?:Helpline|Contact|Phone)?[:\s]*([+0-9\s-]{6,})")
 
 
@@ -97,10 +90,7 @@ def now_iso() -> str:
 
 
 def to_date(value: str | date | None) -> date:
-    """
-    Best-effort date parser that always returns a date.
-    Used throughout app.py to keep Streamlit widgets happy.
-    """
+    """Best-effort parser that always returns a date (defaults to a fixed future date if parsing fails)."""
     if value is None:
         return date(2025, 12, 1)
     if isinstance(value, date):
@@ -121,7 +111,7 @@ def parse_aed(text: str | None, default: int = 0) -> int:
             return int(float(raw))
         except Exception:
             return default
-    # fallback: first integer in the line
+    # fall back to first integer present
     m2 = INT_RE.search(text.replace(",", "")) if text else None
     if m2:
         return int(m2.group(0))
@@ -144,8 +134,7 @@ def clean_lines(block: str) -> List[str]:
     return [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
 
 
-# ============================ Data structures =============================
-
+# ----------------------------- Data Models --------------------------------
 @dataclass
 class EjariFields:
     city: str = "Dubai"
@@ -174,32 +163,43 @@ class ClauseFinding:
 @dataclass
 class AuditResult:
     verdict: str  # "pass" | "fail"
-    issues: List[str]                 # blocking issues only
+    issues: List[str]
     rera_max_increase_pct: float
     proposed_increase_pct: float
     clause_findings: List[ClauseFinding]
-    text_findings: List[str]          # notes/warnings (non-blocking)
+    text_findings: List[str]
     ejari: EjariFields
     notes: List[str]
     contract_text: str
     timestamp: str
 
 
-# =============================== PDF parsing ==============================
+# ----------------------------- PDF Parsing --------------------------------
+EJARI_KEYS = {
+    "Property Usage": "property_usage",
+    "Owner Name": "owner_name",
+    "Landlord Name": "landlord_name",
+    "Tenant Name": "tenant_name",
+    "Location": "community",
+    "Property Type": "property_type",
+    "Contract Period": "period",
+    "Annual Rent": "current_annual_rent_aed",
+    "Security Deposit Amount": "security_deposit_aed",
+    "Bedrooms": "bedrooms",
+}
 
-# (Used if you want to split header vs "Terms & Conditions")
 TERMS_ANCHOR = re.compile(r"(?:Terms?\s*&\s*Conditions?|^Terms\s*:\s*$)", re.I)
 
 
 def parse_ejari_text(text: str) -> EjariFields:
     """
-    Forgiving parser that maps common Ejari/tenancy PDF lines to fields.
-    Works for text-based PDFs and the provided sample templates.
+    Very forgiving parser that tries to map common Ejari/tenancy PDF lines to fields.
+    Works for the sample PDFs and many text-based templates.
     """
     lines = clean_lines(text)
     fields = EjariFields()
 
-    # pass 1: obvious labels and numbers
+    # 1) Shallow scans for obvious labels
     for ln in lines:
         if "Annual Rent" in ln:
             fields.current_annual_rent_aed = parse_aed(ln, fields.current_annual_rent_aed)
@@ -210,47 +210,47 @@ def parse_ejari_text(text: str) -> EjariFields:
             if m:
                 fields.bedrooms = int(m.group(0))
         if "Property Type" in ln:
-            ll = ln.lower()
-            if "villa" in ll:
+            if "villa" in ln.lower():
                 fields.property_type = "villa"
-            elif "townhouse" in ll:
+            elif "townhouse" in ln.lower():
                 fields.property_type = "townhouse"
             else:
                 fields.property_type = "apartment"
-        if "Location" in ln or ln.lower().startswith("area:"):
+        if "Location" in ln or "Area:" in ln:
+            # take everything after colon
             parts = re.split(r"[:\-–]", ln, maxsplit=1)
-            if len(parts) == 2 and parts[1].strip():
+            if len(parts) == 2 and len(parts[1].strip()) > 1:
                 fields.community = parts[1].strip()
         if "Ejari" in ln and ("Contact" in ln or "Helpline" in ln or re.search(r"\+?\d", ln)):
             m = EJARI_CONTACT_RE.search(ln)
             if m:
                 fields.ejari_contact = re.sub(r"\s+", " ", m.group(1)).strip()
 
-    # pass 2: contract period
+    # 2) Dates: try to infer period lines
     for ln in lines:
-        if "Contract Period" in ln or ("From" in ln and "To" in ln):
+        if "Contract Period" in ln or "From" in ln and "To" in ln:
+            # extract two dates
             ds = re.findall(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln)
             if len(ds) >= 1:
                 fields.start_date = to_date(ds[0])
             if len(ds) >= 2:
                 fields.end_date = to_date(ds[1])
 
-    # pass 3: renewal / notice hints
+    # 3) RERA-ish clauses sometimes include renewal or notice hints
     for ln in lines:
         if re.search(r"Renewal|Renewal Date|End Date", ln, re.I):
             m = re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln)
             if m:
                 fields.renewal_date = to_date(m.group(0))
-        if "notice" in ln.lower():
-            m = re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln)
-            if m:
-                fields.notice_sent_date = to_date(m.group(0))
+        if "notice" in ln.lower() and re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln):
+            fields.notice_sent_date = to_date(re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln).group(0))
 
-    # proposed rent if the PDF mentions it
-    for ln in lines[:40]:
+    # 4) Proposed new rent (if present in free text)
+    for ln in lines[:40]:  # header region is enough
         if "Proposed" in ln and "Rent" in ln:
             fields.proposed_new_rent_aed = parse_aed(ln, fields.proposed_new_rent_aed)
 
+    # defaults
     if not fields.renewal_date and fields.end_date:
         fields.renewal_date = fields.end_date
 
@@ -259,8 +259,8 @@ def parse_ejari_text(text: str) -> EjariFields:
 
 def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
     """
-    Extract text with pdfminer/PyPDF; if too little text, try OCR (if available).
-    Returns: {"text": str, "ejari": EjariFields, "ocr_used": bool, "notes": [str]}
+    Extract text from PDF using pdfminer or PyPDF; OCR fallback when available.
+    Also attempts to extract Ejari-like fields for form prefill.
     """
     notes: List[str] = []
     text = ""
@@ -272,6 +272,7 @@ def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
         notes.append(f"PDF text extraction error: {e}")
         text = ""
 
+    # OCR fallback
     ocr_used = False
     if len(text.strip()) < 120:
         ocr = _ocr_pdf_to_text(pdf_bytes)
@@ -280,37 +281,23 @@ def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
             ocr_used = True
             notes.append("OCR fallback used (image PDF).")
         else:
-            notes.append("OCR not available or produced too little text.")
+            notes.append("OCR not available or yielded too little text.")
 
     ejari = parse_ejari_text(text)
     return {"text": text, "ejari": ejari, "ocr_used": ocr_used, "notes": notes}
 
 
-# =========================== RERA helper logic ============================
-
+# ----------------------------- RERA Helpers -------------------------------
 def compute_proposed_increase_pct(current_aed: int, proposed_aed: int) -> float:
     if current_aed <= 0:
         return 0.0
     return round(((proposed_aed - current_aed) / float(current_aed)) * 100.0, 2)
 
 
-def estimate_gap_vs_index(current_aed: int, rera_index_aed: Optional[int]) -> float:
-    """
-    Rough gap % = how far current is below the index (positive means below index).
-    If no index is provided, return 0 to keep audit conservative.
-    """
-    if not rera_index_aed or rera_index_aed <= 0 or current_aed <= 0:
-        return 0.0
-    if current_aed >= rera_index_aed:
-        return 0.0
-    diff = rera_index_aed - current_aed
-    return round((diff / rera_index_aed) * 100.0, 2)
-
-
 def rera_slabs_max_increase(current_vs_index_gap_pct: float) -> float:
     """
-    Implements Decree 43/2013 slabs (publicly summarized thresholds):
-      - If current rent is up to 10% below index → 0%
+    Implements Decree 43/2013 slabs (commonly summarized):
+      - If current rent is up to 10% below market index → 0%
       - >10% to 20% below → up to 5%
       - >20% to 30% below → up to 10%
       - >30% to 40% below → up to 15%
@@ -328,61 +315,66 @@ def rera_slabs_max_increase(current_vs_index_gap_pct: float) -> float:
     return 20.0
 
 
-# ============================= Rule checks ================================
+def estimate_gap_vs_index(current_aed: int, rera_index_aed: Optional[int]) -> float:
+    """
+    Rough gap % = how far current is below index (positive means below index).
+    If no index is provided, return 0 to keep audit conservative.
+    """
+    if not rera_index_aed or rera_index_aed <= 0 or current_aed <= 0:
+        return 0.0
+    if current_aed >= rera_index_aed:
+        return 0.0
+    diff = rera_index_aed - current_aed
+    return round((diff / rera_index_aed) * 100.0, 2)
 
-# Clear illegal/iffy patterns (case-insensitive)
-ILLEGAL_PATTERNS: List[Tuple[re.Pattern[str], str, str]] = [
-    # Eviction without statutory notice; arbitrary eviction
-    (re.compile(r"(?i)evict.*at any time.*without notice"),
-     "Eviction without statutory notice is not allowed (Law 33/2008).", "fail"),
-    (re.compile(r"(?i)landlord.*may evict.*for any reason"),
-     "Eviction must meet lawful grounds under Dubai tenancy laws.", "fail"),
 
-    # Absolute/sole discretion rent increases
-    (re.compile(r"(?i)rent.*(?:increase|adjust).*(?:landlord.?s|landlord’s|landlords).*(?:absolute|sole).*discretion"),
+# ----------------------------- Clause Rules --------------------------------
+ILLEGAL_PATTERNS = [
+    # Unlawful eviction / absolute discretion
+    (re.compile(r"(?i)evict.*at any time.*without notice"), "Eviction without statutory notice is not allowed (Law 33/2008).", "fail"),
+    (re.compile(r"(?i)landlord.*may evict.*for any reason"), "Eviction must meet lawful grounds under Dubai tenancy laws.", "fail"),
+    # Absolute discretion on rent increases
+    (re.compile(r"(?i)rent.*(increase|adjust).*(landlord.?s|landlord’s|landlords).*(absolute|sole).*(discretion)"),
      "Rent increases cannot be at landlord's sole/absolute discretion; must comply with Decree 43/2013.", "fail"),
-
-    # Blanket no-refund (often unfair/unenforceable unless specific)
-    (re.compile(r"(?i)\bno\s+refunds\b"),
-     "Total refund prohibition is often unfair unless narrowly scoped.", "warn"),
-
-    # Vague penalty loading on tenant
-    (re.compile(r"(?i)penalt(?:y|ies).*(tenant)"),
-     "Penalty clauses must be specific and reasonable, not blanket.", "warn"),
+    # No refunds / blanket waivers (often unfair)
+    (re.compile(r"(?i)no\s+refunds"), "Total refund prohibition is typically unfair/unlawful unless specific circumstances.", "warn"),
+    # Tenant pays penalties vaguely specified
+    (re.compile(r"(?i)penalt(y|ies).*(tenant)"), "Penalty clauses must be reasonable, transparent, and specific.", "warn"),
 ]
 
-NOTICE_MIN_DAYS = 90  # common RERA practice around renewal notifications
+NOTICE_MIN_DAYS = 90  # 90-day notice before renewal for rent changes (practice reflected in RERA comms)
 
 
 def scan_clauses(contract_text: str) -> List[ClauseFinding]:
-    """Run rule-based scans line by line."""
-    lines = clean_lines(contract_text)
+    """Run rule-based scans over the free text for clearly illegal/iffy clauses."""
+    lines = [ln.strip() for ln in clean_lines(contract_text)]
     findings: List[ClauseFinding] = []
-    for i, ln in enumerate(lines, start=1):
+    cnum = 1
+    for ln in lines:
         verdict = "pass"
         issues = ""
-        low = ln.lower()
+        lowered = ln.lower()
         for rx, msg, sev in ILLEGAL_PATTERNS:
-            if rx.search(low):
+            if rx.search(lowered):
                 verdict = sev
                 issues = msg
                 break
-        findings.append(ClauseFinding(clause_no=i, text=ln, verdict=verdict, issues=issues))
+        findings.append(ClauseFinding(clause_no=cnum, text=ln, verdict=verdict, issues=issues))
+        cnum += 1
     return findings
 
 
 def check_notice_window(renewal: Optional[date], notice_sent: Optional[date]) -> Tuple[str, str]:
-    """Return ('pass'|'fail'|'warn', message) for the 90-day notice rule-of-thumb."""
+    """Return ('pass'|'fail'|'warn', message) for the 90-day notice rule of thumb."""
     if not renewal or not notice_sent:
-        return "warn", "Missing renewal or notice date; cannot verify the 90-day notice window."
+        return "warn", "Missing renewal or notice date; cannot verify 90-day notice."
     days = (renewal - notice_sent).days
     if days < NOTICE_MIN_DAYS:
-        return "fail", f"Notice appears to be {days} days (< {NOTICE_MIN_DAYS})."
+        return "fail", f"Notice before renewal appears to be {days} days (< {NOTICE_MIN_DAYS})."
     return "pass", f"Notice sent {days} days before renewal."
 
 
-# =============================== Run audit ================================
-
+# ----------------------------- Main Audit ----------------------------------
 def run_audit(
     contract_text: str,
     ejari: EjariFields,
@@ -390,22 +382,16 @@ def run_audit(
 ) -> AuditResult:
     """
     Evaluate the contract text and Ejari fields for compliance signals.
-    Returns an AuditResult where:
-      - verdict == 'fail' only when blocking problems exist
-      - warnings are surfaced in text_findings, not in issues
     """
+    # Clause scans
     clause_findings = scan_clauses(contract_text)
 
     # Rent math
-    proposed_pct = compute_proposed_increase_pct(
-        ejari.current_annual_rent_aed,
-        ejari.proposed_new_rent_aed or ejari.current_annual_rent_aed,
-    )
+    proposed_pct = compute_proposed_increase_pct(ejari.current_annual_rent_aed, ejari.proposed_new_rent_aed or ejari.current_annual_rent_aed)
     gap_pct = estimate_gap_vs_index(ejari.current_annual_rent_aed, rera_index_aed)
     max_allowed_pct = rera_slabs_max_increase(gap_pct)
 
-    issues: List[str] = []     # blocking
-    warnings: List[str] = []   # non-blocking
+    issues: List[str] = []
     text_findings: List[str] = []
 
     # Proposed increase vs allowed
@@ -414,20 +400,18 @@ def run_audit(
             f"Proposed increase {proposed_pct:.1f}% exceeds max allowed {max_allowed_pct:.1f}% (Decree 43/2013 slabs)."
         )
 
-    # 90-day notice
+    # Notice window
     nv, nmsg = check_notice_window(ejari.renewal_date, ejari.notice_sent_date)
-    if nv == "fail":
+    if nv != "pass":
         issues.append(nmsg)
-    else:
-        warnings.append(nmsg)
     text_findings.append(nmsg)
 
-    # Clause failures
+    # Aggregate clause findings → any "fail" makes overall fail
     any_fail = any(cf.verdict == "fail" for cf in clause_findings)
     if any_fail:
         issues.append("One or more clauses are non-compliant (see table).")
 
-    verdict = "fail" if (any_fail or nv == "fail" or any("exceeds" in i for i in issues)) else "pass"
+    verdict = "fail" if (any_fail or len([i for i in issues if "exceeds" in i]) > 0 or nv == "fail") else "pass"
 
     return AuditResult(
         verdict=verdict,
@@ -435,7 +419,7 @@ def run_audit(
         rera_max_increase_pct=max_allowed_pct,
         proposed_increase_pct=proposed_pct,
         clause_findings=clause_findings,
-        text_findings=text_findings + warnings,  # show warnings, but they don't force FAIL
+        text_findings=text_findings,
         ejari=ejari,
         notes=[],
         contract_text=contract_text,
@@ -443,15 +427,14 @@ def run_audit(
     )
 
 
-# =========================== Firestore (Admin) ============================
-
+# ----------------------------- Firestore (Admin) ---------------------------
 _firebase_ready = False
-_firestore = None  # set by init
+_firestore = None  # lazy
 
 
 def firebase_init_from_mapping(cfg: Dict[str, Any]) -> None:
     """
-    Initialize Firebase Admin from a mapping (perfect for st.secrets['firebase']).
+    Initialize Firebase Admin from a dict (Streamlit `st.secrets["firebase"]` is perfect).
     Safe to call multiple times.
     """
     global _firebase_ready, _firestore
@@ -500,9 +483,9 @@ def write_ledger(
     rera_index_aed: Optional[int] = None,
 ) -> str:
     """
-    Append an immutable-style audit record to Firestore:
+    Append an immutable-style audit record into Firestore:
       /agreements/{agreement_id}/ledger/{auto_id}
-    agreement_id is a deterministic hash of (contract_text + landlord + tenant).
+    agreement_id is deterministic: SHA256(contract_text + landlord + tenant).
     """
     if not firebase_available():
         raise RuntimeError("Firestore not initialized")
@@ -511,11 +494,8 @@ def write_ledger(
 
     db: Client = _firestore  # type: ignore
 
-    seed = (
-        (audit.contract_text or "").encode("utf-8")
-        + (landlord or "").encode("utf-8")
-        + (tenant or "").encode("utf-8")
-    )
+    # Deterministic agreement id:
+    seed = (audit.contract_text or "").encode("utf-8") + (landlord or "").encode("utf-8") + (tenant or "").encode("utf-8")
     agreement_id = _sha256_hex(seed)[:32]
 
     doc = {
@@ -537,6 +517,7 @@ def write_ledger(
         "version": 1,
     }
 
+    # Write:
     agreements = db.collection("agreements")
     agreements.document(agreement_id).set({"created_at": audit.timestamp}, merge=True)
     ledger_ref = agreements.document(agreement_id).collection("ledger").document()
