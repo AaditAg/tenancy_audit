@@ -286,4 +286,4 @@ st.caption(
     + ("pdfminer" if getattr(ae, "_pdfminer_ok", False)
        else "pypdf" if getattr(ae, "_pypdf_ok", False)
        else "none")
-)
+)\\
