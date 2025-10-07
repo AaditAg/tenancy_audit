@@ -3,9 +3,9 @@
 # Audit engine with:
 # - PDF extraction (pdfminer -> PyPDF fallback, optional OCR)
 # - Ejari field parsing
-# - Fast rule scan
-# - LLM (Gemini) cross-check against Firestore regulations (optional)
-# - Firestore "ledger" writer
+# - Simple rule checks (fast)
+# - LLM cross-check (Gemini) against Firestore /pdf_articles
+# - Firestore "ledger" writer (append-only style)
 # ---------------------------------------------------------------------
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import io
 import os
 import re
 import json
-import time
 import hashlib
 from dataclasses import dataclass, asdict
 from datetime import datetime, date
@@ -81,6 +80,7 @@ def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
 # =============================== Utilities ===============================
 AED_RE = re.compile(r"(?i)\bAED\s*([0-9][\d,\.]*)")
 INT_RE = re.compile(r"\b\d+\b")
+PCT_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*%")
 EJARI_CONTACT_RE = re.compile(r"(?i)\b(?:Ejari|EJARI)\s*(?:Helpline|Contact|Phone)?[:\s]*([+0-9\s-]{6,})")
 
 KEYWORDS_FOR_LLM = re.compile(
@@ -91,6 +91,7 @@ KEYWORDS_FOR_LLM = re.compile(
 def now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
+
 def to_date(value: str | date | None) -> date:
     if value is None:
         return date(2025, 12, 1)
@@ -100,6 +101,7 @@ def to_date(value: str | date | None) -> date:
         return dtparse(str(value)).date()
     except Exception:
         return date(2025, 12, 1)
+
 
 def parse_aed(text: str | None, default: int = 0) -> int:
     if not text:
@@ -116,8 +118,10 @@ def parse_aed(text: str | None, default: int = 0) -> int:
         return int(m2.group(0))
     return default
 
+
 def clean_lines(block: str) -> List[str]:
     return [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
+
 
 # ============================ Data structures =============================
 @dataclass
@@ -136,6 +140,7 @@ class EjariFields:
     end_date: Optional[date] = None
     ejari_contact: Optional[str] = None
 
+
 @dataclass
 class ClauseFinding:
     clause_no: int
@@ -143,7 +148,8 @@ class ClauseFinding:
     verdict: str  # "pass" | "warn" | "fail"
     issues: str = ""
     llm_reason: Optional[str] = None
-    matched_regs: Optional[List[str]] = None  # titles/articles used
+    matched_regs: Optional[List[str]] = None  # titles/articles we used
+
 
 @dataclass
 class AuditResult:
@@ -153,6 +159,7 @@ class AuditResult:
     notes: List[str]
     contract_text: str
     timestamp: str
+
 
 # =============================== PDF parsing ==============================
 TERMS_ANCHOR = re.compile(r"(?:Terms?\s*&\s*Conditions?|^Terms\s*:\s*$)", re.I)
@@ -207,7 +214,9 @@ def parse_ejari_text(text: str) -> EjariFields:
 
     if not fields.renewal_date and fields.end_date:
         fields.renewal_date = fields.end_date
+
     return fields
+
 
 def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
     notes: List[str] = []
@@ -233,12 +242,13 @@ def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
     ejari = parse_ejari_text(text)
     return {"text": text, "ejari": ejari, "ocr_used": ocr_used, "notes": notes}
 
+
 # ============================= Rule checks ================================
 ILLEGAL_PATTERNS: List[Tuple[re.Pattern[str], str, str]] = [
     (re.compile(r"(?i)evict.*at any time.*without notice"),
      "Eviction without statutory notice is not allowed.", "fail"),
     (re.compile(r"(?i)landlord.*may evict.*for any reason"),
-    "Eviction must meet lawful grounds.", "fail"),
+     "Eviction must meet lawful grounds.", "fail"),
     (re.compile(r"(?i)rent.*(?:increase|adjust).*(?:absolute|sole).*discretion"),
      "Rent increases cannot be at landlord’s sole/absolute discretion.", "fail"),
     (re.compile(r"(?i)\bno\s+refunds\b"),
@@ -260,9 +270,10 @@ def scan_clauses_fast(contract_text: str) -> List[ClauseFinding]:
         findings.append(ClauseFinding(clause_no=i, text=ln, verdict=verdict, issues=issues))
     return findings
 
+
 # ========================== Firestore & Gemini ============================
 _firebase_ready = False
-_firestore = None  # set by init
+_firestore = None
 
 def firebase_init_from_mapping(cfg: Dict[str, Any]) -> None:
     global _firebase_ready, _firestore
@@ -270,7 +281,7 @@ def firebase_init_from_mapping(cfg: Dict[str, Any]) -> None:
         import firebase_admin  # type: ignore
         from firebase_admin import credentials, firestore  # type: ignore
         if not firebase_admin._apps:
-            cred = credentials.Certificate(cfg)  # type: ignore
+            cred = credentials.Certificate(cfg) if isinstance(cfg, dict) else credentials.Certificate(json.loads(cfg))  # type: ignore
             firebase_admin.initialize_app(cred)
         _firestore = firestore.client()
         _firebase_ready = True
@@ -278,59 +289,42 @@ def firebase_init_from_mapping(cfg: Dict[str, Any]) -> None:
         _firebase_ready = False
         raise RuntimeError(f"Firebase init error: {e}")
 
-def firebase_init_from_json_string(sa_json: str) -> None:
-    firebase_init_from_mapping(json.loads(sa_json))
-
-def firebase_init_from_file(path: str) -> None:
+def firebase_init_from_file(path: str = "serviceAccountKeypee.json") -> None:
     with open(path, "r") as f:
-        data = json.load(f)
-    firebase_init_from_mapping(data)
-
-def firebase_init_from_bytes(b: bytes) -> None:
-    firebase_init_from_mapping(json.loads(b.decode("utf-8")))
+        cfg = json.load(f)
+    firebase_init_from_mapping(cfg)
 
 def firebase_available() -> bool:
     return _firebase_ready and (_firestore is not None)
 
-def _fetch_regulations(collection: str, limit: int, hard_timeout_sec: float) -> List[Dict[str, str]]:
+def load_all_regulations(collection: str = "pdf_articles", max_chars_per_doc: int = 8000) -> List[Dict[str, str]]:
     """
-    Fetch up to `limit` regulation docs quickly. Returns list of dicts with title/article/text.
-    Enforces a light hard timeout to keep UI snappy.
+    Pull every article doc: [{'title','article','text'}...]
     """
     if not firebase_available():
         return []
-
     from google.cloud.firestore_v1 import Client  # type: ignore
     db: Client = _firestore  # type: ignore
-
-    start = time.time()
     out: List[Dict[str, str]] = []
-
-    # Use .limit(limit).stream() to keep things bounded.
-    try:
-        docs = db.collection(collection).limit(limit).stream()
-        for doc in docs:
-            d = doc.to_dict() or {}
-            out.append({
-                "title": str(d.get("title") or ""),
-                "article": str(d.get("article") or ""),
-                "text": str(d.get("text") or "")[:5000],  # keep each small for prompting
-            })
-            if len(out) >= limit or (time.time() - start) > hard_timeout_sec:
-                break
-    except Exception:
-        # If anything goes wrong, return what we have (possibly empty).
-        return out
+    for doc in db.collection(collection).stream():
+        d = doc.to_dict() or {}
+        txt = (d.get("text") or "")[:max_chars_per_doc]
+        out.append({
+            "title": str(d.get("title") or ""),
+            "article": str(d.get("article") or ""),
+            "text": txt
+        })
     return out
 
 def _score_article(clause: str, art: Dict[str, str]) -> float:
+    # tiny lexical scorer: overlap of keywords (length>=4)
     words = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", clause)}
     regw = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", art.get("text",""))}
-    if not words or not regw:
+    if not words or not regw: 
         return 0.0
     return len(words & regw) / (len(words) ** 0.5)
 
-def _llm_cross_check(
+def llm_cross_check(
     gemini_api_key: str,
     clause: str,
     regs: List[Dict[str, str]],
@@ -342,7 +336,7 @@ def _llm_cross_check(
     """
     import google.generativeai as genai  # type: ignore
 
-    # choose top_k regs by dumb overlap score
+    # select top_k regs
     sorted_regs = sorted(regs, key=lambda r: _score_article(clause, r), reverse=True)[:top_k]
     context_blocks = []
     titles = []
@@ -353,14 +347,14 @@ def _llm_cross_check(
     context = "\n\n".join(context_blocks) if context_blocks else "No regulations loaded."
 
     genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash")  # fast & cheap
 
     system_prompt = (
         "You are a compliance checker for Dubai tenancy contracts. "
-        "Respond STRICTLY based on the regulations context provided. "
-        "Return JSON only: {\"verdict\":\"pass|warn|fail\",\"reason\":\"...\"}. "
-        "If illegal under RERA/Dubai tenancy regs (e.g., arbitrary eviction, sole-discretion rent increases), use 'fail'. "
-        "If unclear, use 'warn'."
+        "You MUST base your answer strictly on the provided regulations context. "
+        "Output JSON like: {\"verdict\":\"pass|warn|fail\",\"reason\":\"...\"}. "
+        "If the clause is illegal (e.g., arbitrary eviction, rent increase outside RERA rules, etc.) mark 'fail'. "
+        "If unclear, mark 'warn' and explain."
     )
     user_prompt = f"""
 [CLAUSE]
@@ -372,78 +366,67 @@ def _llm_cross_check(
     try:
         resp = model.generate_content([system_prompt, user_prompt])
         txt = (resp.text or "").strip()
+        # Try to extract JSON
         m = re.search(r'\{.*\}', txt, re.S)
         if m:
             js = json.loads(m.group(0))
             v = str(js.get("verdict","warn")).lower().strip()
             if v not in ("pass","warn","fail"):
                 v = "warn"
-            reason = str(js.get("reason","")).strip() or txt[:1500]
+            reason = str(js.get("reason","")).strip() or txt[:4000]
         else:
+            # fallback: heuristic
             low = txt.lower()
-            if any(k in low for k in ("illegal", "contrary", "not permitted", "prohibited")):
-                v, reason = "fail", txt[:1500]
-            elif any(k in low for k in ("unclear", "depends")):
-                v, reason = "warn", txt[:1500]
+            if "illegal" in low or "contrary" in low or "not permitted" in low:
+                v = "fail"
+            elif "unclear" in low or "depends" in low:
+                v = "warn"
             else:
-                v, reason = "pass", txt[:1500]
+                v = "pass"
+            reason = txt[:4000]
         return v, reason, titles
     except Exception as e:
+        # If LLM fails, do not block: warn
         return "warn", f"LLM check error: {e}", titles
 
+
 # =============================== Run audit ================================
-def audit_from_firestore(
+def run_audit(
     contract_text: str,
-    ejari: EjariFields,
-    use_llm: bool = True,
-    clause_cap: int = 25,
-    regs_limit: int = 200,
-    hard_timeout_sec: float = 4.0,
-    time_budget_sec: int = 60,
-    regs_collection: str = "regulations",  # your seeded collection name
+    ejari: EjariFields,                     # kept for future use, not used in verdict math now
+    gemini_api_key: Optional[str] = None,   # if provided, run LLM checks
+    regs_collection: str = "pdf_articles",
 ) -> AuditResult:
     """
-    Back-end audit:
-      1) Fast rule scan on all lines.
-      2) Load up to `regs_limit` regs docs from Firestore with a short hard timeout.
-      3) If LLM enabled and key present, send up to `clause_cap` suspicious clauses for refinement.
-      4) Verdict = PASS iff no 'fail' clauses.
+    Final verdict rule:
+      - Count only 'fail' clauses after LLM cross-check (if enabled).
+      - If failed_count == 0 → PASS; else FAIL.
     """
     notes: List[str] = []
-    t0 = time.time()
-
-    # Step 1: fast scan
+    # Step 1: fast rule scan (labels)
     findings = scan_clauses_fast(contract_text)
 
-    # Step 2: fetch regs quickly
-    regs: List[Dict[str, str]] = []
-    if firebase_available():
-        regs = _fetch_regulations(regs_collection, regs_limit, hard_timeout_sec)
-        if not regs:
-            notes.append("Fetched 0 regulation articles (check collection name or permissions).")
-    else:
-        notes.append("Firestore not initialized; skipping regulations load.")
+    # Step 2: optionally load all regulations & call Gemini on clauses that look relevant
+    if gemini_api_key:
+        if not firebase_available():
+            notes.append("Firestore not initialized: cannot load regulations.")
+        else:
+            regs = load_all_regulations(collection=regs_collection)
+            if not regs:
+                notes.append("No regulations found in Firestore collection.")
+            else:
+                for f in findings:
+                    # Only LLM-check clauses that have meaningful text or matched keywords
+                    if len(f.text) < 8:
+                        continue
+                    if f.verdict == "fail" or KEYWORDS_FOR_LLM.search(f.text):
+                        verdict, reason, titles = llm_cross_check(gemini_api_key, f.text, regs, top_k=8)
+                        # Merge with fast verdict (LLM has the final say):
+                        f.verdict = verdict
+                        f.llm_reason = reason
+                        f.matched_regs = titles
 
-    # Step 3: optional LLM refinement
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if use_llm and gemini_key and regs:
-        # choose clauses to send: those already 'fail' or with keywords
-        candidates = [f for f in findings if len(f.text) >= 8 and (f.verdict == "fail" or KEYWORDS_FOR_LLM.search(f.text))]
-        candidates = candidates[:max(1, int(clause_cap))]
-        for f in candidates:
-            if (time.time() - t0) > time_budget_sec:
-                notes.append("Time budget reached before finishing LLM checks.")
-                break
-            verdict, reason, titles = _llm_cross_check(gemini_key, f.text, regs, top_k=8)
-            f.verdict = verdict
-            f.llm_reason = reason
-            f.matched_regs = titles
-    elif use_llm and not gemini_key:
-        notes.append("Gemini enabled but no GEMINI_API_KEY present; skipped LLM.")
-    elif use_llm and not regs:
-        notes.append("Gemini enabled but no regulations available; skipped LLM.")
-
-    # Step 4: final verdict
+    # Step 3: final verdict = only on fails
     failed_count = sum(1 for f in findings if f.verdict == "fail")
     verdict = "pass" if failed_count == 0 else "fail"
 
@@ -455,6 +438,7 @@ def audit_from_firestore(
         contract_text=contract_text,
         timestamp=now_iso(),
     )
+
 
 # =========================== Firestore ledger =============================
 def _sha256_hex(data: bytes) -> str:
@@ -503,3 +487,21 @@ def write_ledger(
     ledger_ref.set(doc)
 
     return agreement_id
+
+def audit_from_firestore(
+    contract_text: str,
+    ejari: EjariFields,
+    use_llm: bool = True,
+    clause_cap: int = 25,
+    regs_limit: int = 200,
+    hard_timeout_sec: float = 4.0,
+    time_budget_sec: int = 60,
+) -> AuditResult:
+    """
+    1) Fetch up to regs_limit docs from /regulations with a hard timeout (hard_timeout_sec).
+    2) Run your rule scan -> initial AuditResult.
+    3) If use_llm and GEMINI_API_KEY present: select up to clause_cap suspicious clauses,
+       build compact prompts with the regulation articles, ask Gemini, and update verdicts.
+    4) Return final AuditResult (verdict is PASS when 0 'fail' clauses).
+    """
+    ...

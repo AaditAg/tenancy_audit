@@ -1,11 +1,12 @@
 # app.py
 # ----------------------------------------------------------------------
 # Streamlit UI: upload PDF → edit fields → click "Run audit"
-# Regulations are fetched & checked INSIDE audit_engine (backend).
-# UI only shows results; no regulation loading up front.
-# - Verdict = PASS/FAIL showing number of failing clauses (no %s)
-# - Clause table with verdict filter (All / Fail / Warn / Pass)
-# - Optional Gemini refinement (use Streamlit Secrets for key)
+# All regulation fetching & LLM comparison happens INSIDE audit_engine
+# (no regs loaded or shown in frontend).
+# - Headline shows PASS/FAIL with number of failing clauses (no %)
+# - Clause table has a verdict filter (All / Fail / Warn / Pass)
+# - Optional Gemini refinement (key from Secrets only)
+# - Firestore init kept in sidebar
 # ----------------------------------------------------------------------
 
 from __future__ import annotations
@@ -18,11 +19,14 @@ import pandas as pd
 
 import audit_engine as ae
 
+
+# ------------------------- Page config -------------------------
 st.set_page_config(
     page_title="Dubai Tenancy Auditor",
     page_icon="🏠",
     layout="wide",
 )
+
 
 # ------------------------- Sidebar -------------------------
 with st.sidebar:
@@ -83,6 +87,7 @@ with st.sidebar:
         else:
             st.info("Gemini disabled.")
 
+
 # ------------------------- UI Helpers -------------------------
 def _ejari_to_widgets(e: ae.EjariFields) -> Dict[str, Any]:
     return {
@@ -98,6 +103,7 @@ def _ejari_to_widgets(e: ae.EjariFields) -> Dict[str, Any]:
         "notice_sent_date": ae.to_date(e.notice_sent_date),
         "ejari_contact": e.ejari_contact or "",
     }
+
 
 # ------------------------- Main layout -------------------------
 st.title("Dubai Rental Contract Auditor")
@@ -219,6 +225,7 @@ if st.button("Run audit", use_container_width=True):
     )
 
     with st.spinner("Auditing (Firestore regs + optional Gemini)…"):
+        # backend must fetch regulations and do all comparisons/LLM there
         res = ae.audit_from_firestore(
             contract_text=st.session_state.contract_text or "",
             ejari=ej,
@@ -226,12 +233,8 @@ if st.button("Run audit", use_container_width=True):
             clause_cap=int(clause_cap),
             regs_limit=int(regs_limit),
             hard_timeout_sec=4.0,
-            time_budget_sec=60,
+            time_budget_sec=60,  # keep total under ~1 minute
         )
-
-    if res is None:
-        st.error("Backend returned no result (None). Check audit_engine.audit_from_firestore implementation.")
-        st.stop()
 
     # Verdict header: number of failing clauses only
     fail_count = sum(1 for c in res.clause_findings if c.verdict == "fail")
@@ -246,7 +249,7 @@ if st.button("Run audit", use_container_width=True):
     rows = [{
         "clause": c.clause_no,
         "verdict": c.verdict,
-        "issues": c.issues or c.llm_reason or "",
+        "issues": c.issues,
         "text": c.text,
     } for c in res.clause_findings]
     df = pd.DataFrame(rows)
@@ -254,10 +257,10 @@ if st.button("Run audit", use_container_width=True):
         df = df[df["verdict"].str.lower() == filter_val.lower()]
     st.dataframe(df, use_container_width=True)
 
-    # Issues summary (if any notes from backend)
-    if res.notes:
-        st.markdown("### Backend notes")
-        for msg in res.notes:
+    # Issues summary (if any)
+    if res.issues:
+        st.markdown("### Issues summary")
+        for msg in res.issues:
             st.write("•", msg)
 
     # Ledger write (optional)
@@ -267,7 +270,7 @@ if st.button("Run audit", use_container_width=True):
             landlord = "landlord@example.com"
             pdf_bytes = up.getvalue() if up is not None else None
             agreement_id = ae.write_ledger(
-                tenant, landlord, ej, res, pdf_bytes=pdf_bytes, collection_root="agreements"
+                tenant, landlord, ej, res, pdf_bytes=pdf_bytes, rera_index_aed=None
             )
             st.success(f"Ledger entry written ✓  (agreement id: `{agreement_id}`)")
         except Exception as e:
@@ -276,7 +279,7 @@ if st.button("Run audit", use_container_width=True):
 # ------------------------- Footer -------------------------
 st.markdown("---")
 st.caption(
-    "The UI never fetches or shows regulations; the backend loads Firestore regs and compares every clause."
+    "This UI never fetches or shows regulations; the backend (audit_engine.py) loads Firestore regs and compares every clause."
 )
 st.caption(
     "Extractor backend: "
