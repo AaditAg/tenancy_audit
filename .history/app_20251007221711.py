@@ -1,7 +1,6 @@
 # app.py
 # ----------------------------------------------------------------------
 # Streamlit UI: upload PDF → parse → edit fields → run audit → (optional) read regulations
-# Uses Streamlit Secrets for GEMINI_API_KEY (Option 3).
 # ----------------------------------------------------------------------
 
 from __future__ import annotations
@@ -23,11 +22,11 @@ st.set_page_config(
 )
 
 
-# ------------------------- Sidebar: Firestore -------------------------
+# ------------------------- Sidebar: Firestore + Gemini -------------------------
 with st.sidebar:
-    st.header("Cloud")
+    st.header("Cloud & LLM")
 
-    # --- Firestore init (optional, if you want to load /regulations and/or write a ledger) ---
+    # --- Firestore init (optional, only if you want to load /regulations and write a ledger) ---
     st.caption("Initialize Firestore (Admin SDK). Use any ONE method below.")
     svc_upload = st.file_uploader("Upload serviceAccount.json (local dev)", type=["json"], key="svcjson")
 
@@ -50,22 +49,27 @@ with st.sidebar:
     if ae.firebase_available():
         st.info("Firestore: **connected**")
     else:
-        st.warning("Firestore not connected (LLM can still run).")
+        st.warning("Firestore not connected (LLM can still run without regs).")
 
     st.markdown("---")
 
-    # --- Gemini API key from Streamlit Secrets (Option 3) ---
+    # --- Gemini API key (recommended path) ---
     st.subheader("LLM (Gemini)")
-    if "GEMINI_API_KEY" in st.secrets and st.secrets["GEMINI_API_KEY"]:
-        st.success("Gemini API key found in Streamlit Secrets ✓")
-        # Make available to downstream libs that read env:
-        os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
-    else:
-        st.error(
-            "GEMINI_API_KEY not set in Streamlit Secrets.\n\n"
-            "Go to Manage app → Settings → Secrets and add:\n\n"
-            "GEMINI_API_KEY = \"your-key-here\""
-        )
+    st.caption("Paste your Google Generative AI API key below. For public hosting, use secrets/env instead of hard-coding.")
+
+    # ⚠️ You asked to wire your key directly. It's insecure to hard-code in public repos.
+    DEFAULT_GEMINI_KEY = "AIzaSyA3MbD2aXrFME6z0L5KvizA8YXL3kEQM0o"  # ← your key (replace/remove for public hosting)
+
+    gemini_key = st.text_input(
+        "Gemini API Key",
+        type="password",
+        value=os.environ.get("GEMINI_API_KEY", DEFAULT_GEMINI_KEY),
+        help="For production, remove the default and use Streamlit Secrets or env vars.",
+    )
+
+    if gemini_key:
+        os.environ["GEMINI_API_KEY"] = gemini_key
+        st.success("Gemini key set for this session ✓")
 
     st.markdown("---")
 
@@ -107,12 +111,15 @@ def _load_regulations_from_firestore() -> List[Dict[str, str]]:
         out = []
         for d in docs:
             data = d.to_dict() or {}
+            # keep only relevant keys
             out.append({
                 "title": str(data.get("title", "")),
                 "article": str(data.get("article", "")),
                 "text": str(data.get("text", "")),
             })
-        return [x for x in out if x["text"]]
+        # Basic sanity filter
+        out = [x for x in out if x["text"]]
+        return out
     except Exception:
         return []
 
@@ -147,6 +154,7 @@ with right:
     if "contract_text" not in st.session_state:
         st.session_state.contract_text = pdf_text
 
+    # Replace text if a new PDF was uploaded and text differs
     if up is not None and pdf_text and pdf_text != st.session_state.get("contract_text", ""):
         st.session_state.contract_text = pdf_text
 
@@ -164,6 +172,7 @@ st.subheader("3) Extracted / Editable Ejari fields")
 if "ejari" not in st.session_state:
     st.session_state.ejari = _ejari_to_widgets(ejari_prefill)
 
+# If new upload parsed fresh fields, merge (only fill blanks)
 if up is not None:
     parsed_w = _ejari_to_widgets(ejari_prefill)
     for k, v in parsed_w.items():
@@ -171,6 +180,7 @@ if up is not None:
             st.session_state.ejari[k] = v
 
 col_a, col_b = st.columns(2, gap="large")
+
 with col_a:
     st.session_state.ejari["city"] = st.selectbox(
         "City", ["Dubai", "Abu Dhabi", "Sharjah"], index=["Dubai", "Abu Dhabi", "Sharjah"].index(st.session_state.ejari["city"])
@@ -213,70 +223,66 @@ if ae.firebase_available():
 
 # ------------------------- Run audit -------------------------
 st.markdown("---")
-if st.button("Run audit", use_container_width=True):
-    # Ensure Gemini key exists via secrets
-    gem_key = st.secrets.get("GEMINI_API_KEY", "")
-    if not gem_key:
-        st.error(
-            "GEMINI_API_KEY is missing from Streamlit Secrets. "
-            "Open Manage app → Settings → Secrets and add:\n\n"
-            "GEMINI_API_KEY = \"your-key-here\""
-        )
-        st.stop()
-
-    # Propagate to env if downstream libs read it
-    os.environ["GEMINI_API_KEY"] = gem_key
-
-    ej = ae.EjariFields(
-        city=st.session_state.ejari["city"],
-        community=st.session_state.ejari["community"],
-        property_type=st.session_state.ejari["property_type"],
-        bedrooms=int(st.session_state.ejari["bedrooms"]),
-        security_deposit_aed=int(st.session_state.ejari["security_deposit_aed"]),
-        current_annual_rent_aed=int(st.session_state.ejari["current_annual_rent_aed"]),
-        proposed_new_rent_aed=int(st.session_state.ejari["proposed_new_rent_aed"]),
-        furnishing=st.session_state.ejari["furnishing"],
-        renewal_date=ae.to_date(st.session_state.ejari["renewal_date"]),
-        notice_sent_date=ae.to_date(st.session_state.ejari["notice_sent_date"]),
-        ejari_contact=st.session_state.ejari.get("ejari_contact") or None,
-    )
-
-    with st.spinner("Auditing clauses…"):
-        result = ae.run_audit(
-            st.session_state.contract_text or "",
-            ej,
-            rera_index_aed=None,          # optional in this UI
-            regulations=regulations,       # Firestore regs if available
-            gemini_api_key=gem_key         # enable LLM comparisons
+run_col = st.container()
+with run_col:
+    if st.button("Run audit", use_container_width=True):
+        # Build EjariFields
+        ej = ae.EjariFields(
+            city=st.session_state.ejari["city"],
+            community=st.session_state.ejari["community"],
+            property_type=st.session_state.ejari["property_type"],
+            bedrooms=int(st.session_state.ejari["bedrooms"]),
+            security_deposit_aed=int(st.session_state.ejari["security_deposit_aed"]),
+            current_annual_rent_aed=int(st.session_state.ejari["current_annual_rent_aed"]),
+            proposed_new_rent_aed=int(st.session_state.ejari["proposed_new_rent_aed"]),
+            furnishing=st.session_state.ejari["furnishing"],
+            renewal_date=ae.to_date(st.session_state.ejari["renewal_date"]),
+            notice_sent_date=ae.to_date(st.session_state.ejari["notice_sent_date"]),
+            ejari_contact=st.session_state.ejari.get("ejari_contact") or None,
         )
 
-    failures = [c for c in result.clause_findings if c.verdict == "fail"]
-    fail_count = len(failures)
-    if fail_count == 0:
-        st.success("✅ PASS — No failing clauses found.")
-    else:
-        st.error(f"❌ FAIL — {fail_count} failing clause(s) found.")
+        # Pull Gemini key from env (set by sidebar)
+        key = os.environ.get("GEMINI_API_KEY", "")
 
-    if result.issues:
-        st.markdown("### Issues summary (blocking)")
-        for item in result.issues:
-            st.write("•", item)
+        with st.spinner("Auditing clauses…"):
+            result = ae.run_audit(
+                st.session_state.contract_text or "",
+                ej,
+                rera_index_aed=None,          # not used in the simplified UI
+                regulations=regulations,       # Firestore regs if available
+                gemini_api_key=key             # enable LLM comparisons
+            )
 
-    st.markdown("### Clause results")
-    df = pd.DataFrame([{
-        "clause": c.clause_no,
-        "verdict": c.verdict,
-        "issues": c.issues,
-        "text": c.text,
-    } for c in result.clause_findings])
+        # Enforce the simple final verdict rule in the UI:
+        failures = [c for c in result.clause_findings if c.verdict == "fail"]
+        fail_count = len(failures)
+        if fail_count == 0:
+            st.success("✅ PASS — No failing clauses found.")
+        else:
+            st.error(f"❌ FAIL — {fail_count} failing clause(s) found.")
 
-    filter_choice = st.selectbox("Filter", ["All", "Pass", "Warn", "Fail"], index=0)
-    if filter_choice != "All":
-        df_show = df[df["verdict"].str.lower() == filter_choice.lower()]
-    else:
-        df_show = df
+        # Optional: show blocking issues (if the engine provided any)
+        if result.issues:
+            st.markdown("### Issues summary (blocking)")
+            for item in result.issues:
+                st.write("•", item)
 
-    st.dataframe(df_show, use_container_width=True)
+        # Table + filter
+        st.markdown("### Clause results")
+        df = pd.DataFrame([{
+            "clause": c.clause_no,
+            "verdict": c.verdict,
+            "issues": c.issues,
+            "text": c.text,
+        } for c in result.clause_findings])
+
+        filter_choice = st.selectbox("Filter", ["All", "Pass", "Warn", "Fail"], index=0)
+        if filter_choice != "All":
+            df_show = df[df["verdict"].str.lower() == filter_choice.lower()]
+        else:
+            df_show = df
+
+        st.dataframe(df_show, use_container_width=True)
 
 # ------------------------- Footer -------------------------
 st.markdown("---")

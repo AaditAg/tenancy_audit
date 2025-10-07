@@ -1,30 +1,13 @@
-# audit_engine.py
-# ---------------------------------------------------------------------
-# Audit engine with:
-# - PDF extraction (pdfminer -> PyPDF fallback, optional OCR)
-# - Ejari field parsing
-# - Simple rule checks (fast)
-# - LLM cross-check (Gemini) against Firestore /pdf_articles
-# - Firestore "ledger" writer (append-only style)
-# ---------------------------------------------------------------------
-
 from __future__ import annotations
-
-import io
-import os
-import re
-import json
-import hashlib
+import io, os, re, json, hashlib
 from dataclasses import dataclass, asdict
 from datetime import datetime, date
 from typing import Optional, List, Dict, Tuple, Any
-
 from dateutil.parser import parse as dtparse
 
 # ============================ PDF extraction =============================
 _pdfminer_ok = False
 _pypdf_ok = False
-
 try:
     from pdfminer.high_level import extract_text as _pdfminer_extract_text  # type: ignore
     _pdfminer_ok = True
@@ -33,18 +16,15 @@ except Exception:
 
 try:
     import pypdf  # type: ignore
-
     def _pypdf_extract_text(pdf_bytes: bytes) -> str:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
         out: List[str] = []
         for page in reader.pages:
             out.append(page.extract_text() or "")
         return "\n".join(out)
-
     _pypdf_ok = True
 except Exception:
     _pypdf_ok = False
-
 
 def _extract_text_any(pdf_bytes: bytes) -> str:
     if _pdfminer_ok:
@@ -59,13 +39,11 @@ def _extract_text_any(pdf_bytes: bytes) -> str:
             pass
     return ""
 
-
 def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
     try:
         from pdf2image import convert_from_bytes  # type: ignore
         import pytesseract  # type: ignore
         from PIL import Image  # type: ignore
-
         images = convert_from_bytes(pdf_bytes)
         texts: List[str] = []
         for im in images:
@@ -76,21 +54,14 @@ def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
     except Exception:
         return ""
 
-
 # =============================== Utilities ===============================
 AED_RE = re.compile(r"(?i)\bAED\s*([0-9][\d,\.]*)")
 INT_RE = re.compile(r"\b\d+\b")
 PCT_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*%")
 EJARI_CONTACT_RE = re.compile(r"(?i)\b(?:Ejari|EJARI)\s*(?:Helpline|Contact|Phone)?[:\s]*([+0-9\s-]{6,})")
 
-KEYWORDS_FOR_LLM = re.compile(
-    r"\b(evict|eviction|terminate|termination|increase|rent|deposit|maintenance|penalty|notice|refund|withhold|arbitrary|discretion)\b",
-    re.I
-)
-
 def now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
 
 def to_date(value: str | date | None) -> date:
     if value is None:
@@ -101,7 +72,6 @@ def to_date(value: str | date | None) -> date:
         return dtparse(str(value)).date()
     except Exception:
         return date(2025, 12, 1)
-
 
 def parse_aed(text: str | None, default: int = 0) -> int:
     if not text:
@@ -118,10 +88,19 @@ def parse_aed(text: str | None, default: int = 0) -> int:
         return int(m2.group(0))
     return default
 
+def parse_pct(text: str | None, default: float = 0.0) -> float:
+    if not text:
+        return default
+    m = PCT_RE.search(text)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return default
+    return default
 
 def clean_lines(block: str) -> List[str]:
     return [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
-
 
 # ============================ Data structures =============================
 @dataclass
@@ -140,26 +119,26 @@ class EjariFields:
     end_date: Optional[date] = None
     ejari_contact: Optional[str] = None
 
-
 @dataclass
 class ClauseFinding:
     clause_no: int
     text: str
     verdict: str  # "pass" | "warn" | "fail"
     issues: str = ""
-    llm_reason: Optional[str] = None
-    matched_regs: Optional[List[str]] = None  # titles/articles we used
-
+    matched_rules: List[str] = None  # regulation rule ids matched
 
 @dataclass
 class AuditResult:
     verdict: str  # "pass" | "fail"
-    failed_count: int
+    issues: List[str]
+    rera_max_increase_pct: float
+    proposed_increase_pct: float
     clause_findings: List[ClauseFinding]
+    text_findings: List[str]
+    ejari: EjariFields
     notes: List[str]
     contract_text: str
     timestamp: str
-
 
 # =============================== PDF parsing ==============================
 TERMS_ANCHOR = re.compile(r"(?:Terms?\s*&\s*Conditions?|^Terms\s*:\s*$)", re.I)
@@ -167,7 +146,6 @@ TERMS_ANCHOR = re.compile(r"(?:Terms?\s*&\s*Conditions?|^Terms\s*:\s*$)", re.I)
 def parse_ejari_text(text: str) -> EjariFields:
     lines = clean_lines(text)
     fields = EjariFields()
-
     for ln in lines:
         if "Annual Rent" in ln:
             fields.current_annual_rent_aed = parse_aed(ln, fields.current_annual_rent_aed)
@@ -193,7 +171,6 @@ def parse_ejari_text(text: str) -> EjariFields:
             m = EJARI_CONTACT_RE.search(ln)
             if m:
                 fields.ejari_contact = re.sub(r"\s+", " ", m.group(1)).strip()
-
     for ln in lines:
         if "Contract Period" in ln or ("From" in ln and "To" in ln):
             ds = re.findall(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln)
@@ -201,7 +178,6 @@ def parse_ejari_text(text: str) -> EjariFields:
                 fields.start_date = to_date(ds[0])
             if len(ds) >= 2:
                 fields.end_date = to_date(ds[1])
-
     for ln in lines:
         if re.search(r"Renewal|Renewal Date|End Date", ln, re.I):
             m = re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln)
@@ -211,12 +187,12 @@ def parse_ejari_text(text: str) -> EjariFields:
             m = re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", ln)
             if m:
                 fields.notice_sent_date = to_date(m.group(0))
-
+    for ln in lines[:40]:
+        if "Proposed" in ln and "Rent" in ln:
+            fields.proposed_new_rent_aed = parse_aed(ln, fields.proposed_new_rent_aed)
     if not fields.renewal_date and fields.end_date:
         fields.renewal_date = fields.end_date
-
     return fields
-
 
 def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
     notes: List[str] = []
@@ -228,7 +204,6 @@ def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
     except Exception as e:
         notes.append(f"PDF text extraction error: {e}")
         text = ""
-
     ocr_used = False
     if len(text.strip()) < 120:
         ocr = _ocr_pdf_to_text(pdf_bytes)
@@ -238,24 +213,100 @@ def parse_pdf_smart(pdf_bytes: bytes) -> Dict[str, Any]:
             notes.append("OCR fallback used (image PDF).")
         else:
             notes.append("OCR not available or produced too little text.")
-
     ejari = parse_ejari_text(text)
     return {"text": text, "ejari": ejari, "ocr_used": ocr_used, "notes": notes}
 
+# =========================== RERA helper logic ============================
+def compute_proposed_increase_pct(current_aed: int, proposed_aed: int) -> float:
+    if current_aed <= 0:
+        return 0.0
+    return round(((proposed_aed - current_aed) / float(current_aed)) * 100.0, 2)
+
+def estimate_gap_vs_index(current_aed: int, rera_index_aed: Optional[int]) -> float:
+    if not rera_index_aed or rera_index_aed <= 0 or current_aed <= 0:
+        return 0.0
+    if current_aed >= rera_index_aed:
+        return 0.0
+    diff = rera_index_aed - current_aed
+    return round((diff / rera_index_aed) * 100.0, 2)
+
+def rera_slabs_max_increase(current_vs_index_gap_pct: float) -> float:
+    gap = max(0.0, current_vs_index_gap_pct)
+    # Mirrors Decree (43) of 2013 Article 1 slabs. :contentReference[oaicite:0]{index=0}
+    if gap <= 10:
+        return 0.0
+    if gap <= 20:
+        return 5.0
+    if gap <= 30:
+        return 10.0
+    if gap <= 40:
+        return 15.0
+    return 20.0
 
 # ============================= Rule checks ================================
+# Text patterns for immediate flags. These are conservative and targeted.
 ILLEGAL_PATTERNS: List[Tuple[re.Pattern[str], str, str]] = [
+    # Eviction without lawful grounds / notice
     (re.compile(r"(?i)evict.*at any time.*without notice"),
-     "Eviction without statutory notice is not allowed.", "fail"),
+     "Eviction without statutory grounds/notice is not allowed.", "fail"),
     (re.compile(r"(?i)landlord.*may evict.*for any reason"),
-     "Eviction must meet lawful grounds.", "fail"),
-    (re.compile(r"(?i)rent.*(?:increase|adjust).*(?:absolute|sole).*discretion"),
-     "Rent increases cannot be at landlord’s sole/absolute discretion.", "fail"),
+     "Eviction must meet lawful grounds in Dubai tenancy laws.", "fail"),
+
+    # Landlord absolute/sole discretion to raise rent (contrary to RERA slabs and index)
+    (re.compile(r"(?i)rent.*(?:increase|adjust).*(?:landlord.?s|landlord’s|landlords).*(?:absolute|sole).*discretion"),
+     "Rent increases cannot be at landlord’s sole/absolute discretion; must follow rent index slabs.", "fail"),
+
+    # Blanket “no refunds”
     (re.compile(r"(?i)\bno\s+refunds\b"),
      "Total refund prohibition is often unfair unless narrowly scoped.", "warn"),
+
+    # Vague penalties solely on tenant
+    (re.compile(r"(?i)penalt(?:y|ies).*(tenant)"),
+     "Penalty clauses must be specific and reasonable, not blanket.", "warn"),
 ]
 
-def scan_clauses_fast(contract_text: str) -> List[ClauseFinding]:
+NOTICE_MIN_DAYS = 90  # RERA practice around renewal notifications
+
+# -------- Firestore-backed regulation matching (optional) -----------------
+_firestore_rules: List[Dict[str, Any]] = []
+_rules_loaded = False
+
+def _load_rules_from_firestore() -> None:
+    """Load regulations previously seeded to Firestore: /regulations/{docId}"""
+    global _rules_loaded, _firestore_rules
+    if _rules_loaded:
+        return
+    try:
+        if not firebase_available():
+            return
+        rules = _firestore.collection("regulations").stream()
+        _firestore_rules = []
+        for r in rules:
+            d = r.to_dict()
+            # Expect: { id, title, source, article, text }
+            if d and "text" in d:
+                _firestore_rules.append(d)
+        _rules_loaded = True
+    except Exception:
+        _rules_loaded = False
+        _firestore_rules = []
+
+def _match_against_rules(line: str) -> List[str]:
+    """Very simple keyword scan against stored regulation snippets."""
+    if not _rules_loaded:
+        _load_rules_from_firestore()
+    if not _firestore_rules:
+        return []
+    low = line.lower()
+    hits: List[str] = []
+    for rule in _firestore_rules[:800]:  # cap for speed
+        txt = str(rule.get("text", "")).lower()
+        # Heuristic: both ways containment (small lines vs article paragraphs)
+        if (len(low) > 20 and any(tok in low for tok in txt.split()[:5])) or (len(txt) > 20 and any(tok in txt for tok in low.split()[:5])):
+            hits.append(rule.get("id") or rule.get("title") or "rule")
+    return hits[:10]
+
+def scan_clauses(contract_text: str) -> List[ClauseFinding]:
     lines = clean_lines(contract_text)
     findings: List[ClauseFinding] = []
     for i, ln in enumerate(lines, start=1):
@@ -267,13 +318,64 @@ def scan_clauses_fast(contract_text: str) -> List[ClauseFinding]:
                 verdict = sev
                 issues = msg
                 break
-        findings.append(ClauseFinding(clause_no=i, text=ln, verdict=verdict, issues=issues))
+        matched = _match_against_rules(ln)
+        findings.append(ClauseFinding(clause_no=i, text=ln, verdict=verdict, issues=issues, matched_rules=matched))
     return findings
 
+# Keep (informational) 90-day notice check but it does NOT affect pass/fail now.
+def check_notice_window(renewal: Optional[date], notice_sent: Optional[date]) -> Tuple[str, str]:
+    if not renewal or not notice_sent:
+        return "warn", "Missing renewal or notice date; cannot verify the 90-day notice window."
+    days = (renewal - notice_sent).days
+    if days < NOTICE_MIN_DAYS:
+        return "warn", f"Notice appears to be {days} days (< {NOTICE_MIN_DAYS})."
+    return "pass", f"Notice sent {days} days before renewal."
 
-# ========================== Firestore & Gemini ============================
+# =============================== Run audit ================================
+def run_audit(
+    contract_text: str,
+    ejari: EjariFields,
+    rera_index_aed: Optional[int] = None,
+) -> AuditResult:
+    clause_findings = scan_clauses(contract_text)
+
+    # Informational rent math
+    proposed_pct = compute_proposed_increase_pct(
+        ejari.current_annual_rent_aed,
+        ejari.proposed_new_rent_aed or ejari.current_annual_rent_aed,
+    )
+    gap_pct = estimate_gap_vs_index(ejari.current_annual_rent_aed, rera_index_aed)
+    max_allowed_pct = rera_slabs_max_increase(gap_pct)
+
+    text_findings: List[str] = []
+    # Keep notice info as a note only
+    _, nmsg = check_notice_window(ejari.renewal_date, ejari.notice_sent_date)
+    text_findings.append(nmsg)
+
+    # Headline verdict is based ONLY on clause failures (your requirement)
+    any_fail = any(cf.verdict == "fail" for cf in clause_findings)
+    verdict = "fail" if any_fail else "pass"
+
+    # issues: keep purely non-clause messages that you want to display in the sidebar
+    issues: List[str] = []
+    # DO NOT append rent exceed messages to avoid impacting the “pass/fail by clauses” rule.
+
+    return AuditResult(
+        verdict=verdict,
+        issues=issues,
+        rera_max_increase_pct=max_allowed_pct,
+        proposed_increase_pct=proposed_pct,
+        clause_findings=clause_findings,
+        text_findings=text_findings,
+        ejari=ejari,
+        notes=[],
+        contract_text=contract_text,
+        timestamp=now_iso(),
+    )
+
+# =========================== Firestore (Admin) ============================
 _firebase_ready = False
-_firestore = None
+_firestore = None  # type: ignore
 
 def firebase_init_from_mapping(cfg: Dict[str, Any]) -> None:
     global _firebase_ready, _firestore
@@ -281,7 +383,7 @@ def firebase_init_from_mapping(cfg: Dict[str, Any]) -> None:
         import firebase_admin  # type: ignore
         from firebase_admin import credentials, firestore  # type: ignore
         if not firebase_admin._apps:
-            cred = credentials.Certificate(cfg) if isinstance(cfg, dict) else credentials.Certificate(json.loads(cfg))  # type: ignore
+            cred = credentials.Certificate(cfg)  # type: ignore
             firebase_admin.initialize_app(cred)
         _firestore = firestore.client()
         _firebase_ready = True
@@ -289,158 +391,20 @@ def firebase_init_from_mapping(cfg: Dict[str, Any]) -> None:
         _firebase_ready = False
         raise RuntimeError(f"Firebase init error: {e}")
 
-def firebase_init_from_file(path: str = "serviceAccountKeypee.json") -> None:
+def firebase_init_from_json_string(sa_json: str) -> None:
+    firebase_init_from_mapping(json.loads(sa_json))
+
+def firebase_init_from_file(path: str) -> None:
     with open(path, "r") as f:
-        cfg = json.load(f)
-    firebase_init_from_mapping(cfg)
+        data = json.load(f)
+    firebase_init_from_mapping(data)
+
+def firebase_init_from_bytes(b: bytes) -> None:
+    firebase_init_from_mapping(json.loads(b.decode("utf-8")))
 
 def firebase_available() -> bool:
     return _firebase_ready and (_firestore is not None)
 
-def load_all_regulations(collection: str = "pdf_articles", max_chars_per_doc: int = 8000) -> List[Dict[str, str]]:
-    """
-    Pull every article doc: [{'title','article','text'}...]
-    """
-    if not firebase_available():
-        return []
-    from google.cloud.firestore_v1 import Client  # type: ignore
-    db: Client = _firestore  # type: ignore
-    out: List[Dict[str, str]] = []
-    for doc in db.collection(collection).stream():
-        d = doc.to_dict() or {}
-        txt = (d.get("text") or "")[:max_chars_per_doc]
-        out.append({
-            "title": str(d.get("title") or ""),
-            "article": str(d.get("article") or ""),
-            "text": txt
-        })
-    return out
-
-def _score_article(clause: str, art: Dict[str, str]) -> float:
-    # tiny lexical scorer: overlap of keywords (length>=4)
-    words = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", clause)}
-    regw = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", art.get("text",""))}
-    if not words or not regw: 
-        return 0.0
-    return len(words & regw) / (len(words) ** 0.5)
-
-def llm_cross_check(
-    gemini_api_key: str,
-    clause: str,
-    regs: List[Dict[str, str]],
-    top_k: int = 8,
-) -> Tuple[str, str, List[str]]:
-    """
-    Ask Gemini to validate this clause vs the most relevant regulations.
-    Returns: (verdict: pass|warn|fail, reason, matched_titles)
-    """
-    import google.generativeai as genai  # type: ignore
-
-    # select top_k regs
-    sorted_regs = sorted(regs, key=lambda r: _score_article(clause, r), reverse=True)[:top_k]
-    context_blocks = []
-    titles = []
-    for r in sorted_regs:
-        t = (r["title"] + " — " + r["article"]).strip(" —")
-        titles.append(t)
-        context_blocks.append(f"### {t}\n{r['text'][:1500]}")
-    context = "\n\n".join(context_blocks) if context_blocks else "No regulations loaded."
-
-    genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")  # fast & cheap
-
-    system_prompt = (
-        "You are a compliance checker for Dubai tenancy contracts. "
-        "You MUST base your answer strictly on the provided regulations context. "
-        "Output JSON like: {\"verdict\":\"pass|warn|fail\",\"reason\":\"...\"}. "
-        "If the clause is illegal (e.g., arbitrary eviction, rent increase outside RERA rules, etc.) mark 'fail'. "
-        "If unclear, mark 'warn' and explain."
-    )
-    user_prompt = f"""
-[CLAUSE]
-{clause}
-
-[REGULATIONS CONTEXT]
-{context}
-"""
-    try:
-        resp = model.generate_content([system_prompt, user_prompt])
-        txt = (resp.text or "").strip()
-        # Try to extract JSON
-        m = re.search(r'\{.*\}', txt, re.S)
-        if m:
-            js = json.loads(m.group(0))
-            v = str(js.get("verdict","warn")).lower().strip()
-            if v not in ("pass","warn","fail"):
-                v = "warn"
-            reason = str(js.get("reason","")).strip() or txt[:4000]
-        else:
-            # fallback: heuristic
-            low = txt.lower()
-            if "illegal" in low or "contrary" in low or "not permitted" in low:
-                v = "fail"
-            elif "unclear" in low or "depends" in low:
-                v = "warn"
-            else:
-                v = "pass"
-            reason = txt[:4000]
-        return v, reason, titles
-    except Exception as e:
-        # If LLM fails, do not block: warn
-        return "warn", f"LLM check error: {e}", titles
-
-
-# =============================== Run audit ================================
-def run_audit(
-    contract_text: str,
-    ejari: EjariFields,                     # kept for future use, not used in verdict math now
-    gemini_api_key: Optional[str] = None,   # if provided, run LLM checks
-    regs_collection: str = "pdf_articles",
-) -> AuditResult:
-    """
-    Final verdict rule:
-      - Count only 'fail' clauses after LLM cross-check (if enabled).
-      - If failed_count == 0 → PASS; else FAIL.
-    """
-    notes: List[str] = []
-    # Step 1: fast rule scan (labels)
-    findings = scan_clauses_fast(contract_text)
-
-    # Step 2: optionally load all regulations & call Gemini on clauses that look relevant
-    if gemini_api_key:
-        if not firebase_available():
-            notes.append("Firestore not initialized: cannot load regulations.")
-        else:
-            regs = load_all_regulations(collection=regs_collection)
-            if not regs:
-                notes.append("No regulations found in Firestore collection.")
-            else:
-                for f in findings:
-                    # Only LLM-check clauses that have meaningful text or matched keywords
-                    if len(f.text) < 8:
-                        continue
-                    if f.verdict == "fail" or KEYWORDS_FOR_LLM.search(f.text):
-                        verdict, reason, titles = llm_cross_check(gemini_api_key, f.text, regs, top_k=8)
-                        # Merge with fast verdict (LLM has the final say):
-                        f.verdict = verdict
-                        f.llm_reason = reason
-                        f.matched_regs = titles
-
-    # Step 3: final verdict = only on fails
-    failed_count = sum(1 for f in findings if f.verdict == "fail")
-    verdict = "pass" if failed_count == 0 else "fail"
-
-    return AuditResult(
-        verdict=verdict,
-        failed_count=failed_count,
-        clause_findings=findings,
-        notes=notes,
-        contract_text=contract_text,
-        timestamp=now_iso(),
-    )
-
-
-# =========================== Firestore ledger =============================
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -450,11 +414,10 @@ def write_ledger(
     ejari: EjariFields,
     audit: AuditResult,
     pdf_bytes: Optional[bytes] = None,
-    collection_root: str = "agreements",
+    rera_index_aed: Optional[int] = None,
 ) -> str:
     if not firebase_available():
         raise RuntimeError("Firestore not initialized")
-
     from google.cloud.firestore_v1 import Client  # type: ignore
     db: Client = _firestore  # type: ignore
 
@@ -470,20 +433,22 @@ def write_ledger(
         "tenant": tenant,
         "landlord": landlord,
         "ejari": asdict(ejari),
+        "rera_index_aed": rera_index_aed,
         "audit": {
             "verdict": audit.verdict,
-            "failed_count": audit.failed_count,
+            "issues": audit.issues,
+            "proposed_increase_pct": audit.proposed_increase_pct,
+            "rera_max_increase_pct": audit.rera_max_increase_pct,
+            "text_findings": audit.text_findings,
             "clause_findings": [asdict(c) for c in audit.clause_findings],
-            "notes": audit.notes,
         },
         "contract_text_hash": _sha256_hex((audit.contract_text or "").encode("utf-8")),
         "pdf_sha256": _sha256_hex(pdf_bytes) if pdf_bytes else None,
         "version": 2,
     }
 
-    agreements = db.collection(collection_root)
+    agreements = db.collection("agreements")
     agreements.document(agreement_id).set({"created_at": audit.timestamp}, merge=True)
     ledger_ref = agreements.document(agreement_id).collection("ledger").document()
     ledger_ref.set(doc)
-
     return agreement_id
