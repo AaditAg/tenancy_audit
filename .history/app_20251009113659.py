@@ -277,33 +277,18 @@ if st.button("Run audit now"):
 
     # Horizontally scrollable container and tuned column widths
     st.markdown("<div style='overflow-x:auto;'>", unsafe_allow_html=True)
-    try:
-        st.dataframe(
-            df,
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "clause": st.column_config.NumberColumn("clause", width="small"),
-                "verdict": st.column_config.TextColumn("verdict", width="small"),
-                "law": st.column_config.TextColumn("law", width="small"),
-                "text": st.column_config.TextColumn("text", width="large"),
-                "issues": st.column_config.TextColumn("issues", width="large"),
-            },
-        )
-    except TypeError:
-        # Backward-compat for Streamlit versions expecting integer width or use_container_width
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "clause": st.column_config.NumberColumn("clause", width="small"),
-                "verdict": st.column_config.TextColumn("verdict", width="small"),
-                "law": st.column_config.TextColumn("law", width="small"),
-                "text": st.column_config.TextColumn("text", width="large"),
-                "issues": st.column_config.TextColumn("issues", width="large"),
-            },
-        )
+    st.dataframe(
+        df,
+        width='stretch',
+        hide_index=True,
+        column_config={
+            "clause": st.column_config.NumberColumn("clause", width="small"),
+            "verdict": st.column_config.TextColumn("verdict", width="small"),
+            "law": st.column_config.TextColumn("law", width="small"),
+            "text": st.column_config.TextColumn("text", width="large"),
+            "issues": st.column_config.TextColumn("issues", width="large"),
+        },
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### Text findings")
