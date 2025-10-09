@@ -200,9 +200,13 @@ if st.button("Run audit now", use_container_width=True):
     else:
         st.error("FAIL — Issues found.")
 
-    # Show single summary metric: number of failed clauses
-    failed_count = sum(1 for c in res.clause_findings if c.verdict == "fail")
-    st.metric("Failed clauses", f"{failed_count}")
+    mcols = st.columns(3)
+    with mcols[0]:
+        st.metric("RERA Avg (AED)", f"{(rera_index_aed or 0):,}")
+    with mcols[1]:
+        st.metric("Max Allowed % (Decree 43/2013)", f"{res.rera_max_increase_pct:.0f}%")
+    with mcols[2]:
+        st.metric("Proposed %", f"{res.proposed_increase_pct:.1f}%")
 
     # Clauses table (from text)
     st.markdown("### 📌 Clause verdicts (from your PDF terms)")

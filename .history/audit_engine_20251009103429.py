@@ -1,3 +1,4 @@
+@ -0,0 +1,526 @@
 # audit_engine.py
 # ----------------------------------------------------------------------
 # Core audit engine for Dubai tenancy contracts (Ejari-style parsing).
@@ -188,7 +189,7 @@ EJARI_KEYS = {
     "Bedrooms": "bedrooms",
 }
 
-TERMS_ANCHOR = re.compile(r"(?:Terms?\s*&\s*Conditions?|^Terms\s*:\s*$)", re.IGNORECASE)
+TERMS_ANCHOR = re.compile(r"(?i)Terms?\s*&\s*Conditions?|(?i)^Terms\s*:\s*$")
 
 
 def parse_ejari_text(text: str) -> EjariFields:
@@ -331,13 +332,10 @@ def estimate_gap_vs_index(current_aed: int, rera_index_aed: Optional[int]) -> fl
 # ----------------------------- Clause Rules --------------------------------
 ILLEGAL_PATTERNS = [
     # Unlawful eviction / absolute discretion
-    (re.compile(r"evict.*at any time.*without notice", re.IGNORECASE), "Eviction without statutory notice is not allowed (Law 33/2008).", "fail"),
-    (re.compile(r"evict.*without\s+notice", re.IGNORECASE), "Eviction without statutory notice is not allowed (Law 33/2008).", "fail"),
+    (re.compile(r"(?i)evict.*at any time.*without notice"), "Eviction without statutory notice is not allowed (Law 33/2008).", "fail"),
     (re.compile(r"(?i)landlord.*may evict.*for any reason"), "Eviction must meet lawful grounds under Dubai tenancy laws.", "fail"),
-    # Absolute/sole discretion on rent increases (various phrasings and word orders)
-    (re.compile(r"rent.*(increase|adjust).*(landlord(?:'?s)?|landlords?).*(absolute|sole).*(discretion)(?:s)?", re.IGNORECASE),
-     "Rent increases cannot be at landlord's sole/absolute discretion; must comply with Decree 43/2013.", "fail"),
-    (re.compile(r"(landlord(?:'?s)?|landlords?).*(increase|adjust).*rent.*(absolute|sole).*(discretion)(?:s)?", re.IGNORECASE),
+    # Absolute discretion on rent increases
+    (re.compile(r"(?i)rent.*(increase|adjust).*(landlord.?s|landlord’s|landlords).*(absolute|sole).*(discretion)"),
      "Rent increases cannot be at landlord's sole/absolute discretion; must comply with Decree 43/2013.", "fail"),
     # No refunds / blanket waivers (often unfair)
     (re.compile(r"(?i)no\s+refunds"), "Total refund prohibition is typically unfair/unlawful unless specific circumstances.", "warn"),
@@ -414,8 +412,7 @@ def run_audit(
     if any_fail:
         issues.append("One or more clauses are non-compliant (see table).")
 
-    # Verdict strictly based on clause failures per requirement
-    verdict = "fail" if any_fail else "pass"
+    verdict = "fail" if (any_fail or len([i for i in issues if "exceeds" in i]) > 0 or nv == "fail") else "pass"
 
     return AuditResult(
         verdict=verdict,
