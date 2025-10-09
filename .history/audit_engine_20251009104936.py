@@ -470,15 +470,11 @@ def run_audit(
     contract_text: str,
     ejari: EjariFields,
     rera_index_aed: Optional[int] = None,
-    use_ai: bool = False,
-    ai_api_key: Optional[str] = None,
-    ai_articles_csv_path: Optional[str] = None,
-    ai_articles_memory: Optional[List[str]] = None,
 ) -> AuditResult:
     """
     Evaluate the contract text and Ejari fields for compliance signals.
     """
-    # Clause scans (regex layer)
+    # Clause scans
     clause_findings = scan_clauses(contract_text)
 
     # Rent math
@@ -500,34 +496,6 @@ def run_audit(
     if nv != "pass":
         issues.append(nmsg)
     text_findings.append(nmsg)
-
-    # Optional AI layer: check each clause against provided articles
-    if use_ai and (ai_api_key or os.environ.get("GEMINI_API_KEY")):
-        api_key = ai_api_key or os.environ.get("GEMINI_API_KEY", "")
-        articles: List[str] = []
-        if ai_articles_memory:
-            articles = list(ai_articles_memory)
-        elif ai_articles_csv_path and os.path.exists(ai_articles_csv_path):
-            articles = read_articles_texts_from_csv(ai_articles_csv_path)
-
-        ai_any_fail = False
-        for idx, cf in enumerate(clause_findings):
-            verdict, reason = _gemini_check_clause_against_articles(cf.text, articles, api_key)
-            if verdict == "fail":
-                ai_any_fail = True
-                # annotate this clause if regex didn't already fail
-                if cf.verdict == "pass":
-                    clause_findings[idx] = ClauseFinding(
-                        clause_no=cf.clause_no,
-                        text=cf.text,
-                        verdict="fail",
-                        issues=(cf.issues + "; " if cf.issues else "") + f"AI: {reason}",
-                    )
-                else:
-                    # append AI reason
-                    clause_findings[idx].issues = (clause_findings[idx].issues + "; " if clause_findings[idx].issues else "") + f"AI: {reason}"
-        if ai_any_fail:
-            issues.append("AI layer flagged one or more clauses as non-compliant.")
 
     # Aggregate clause findings → any "fail" makes overall fail
     any_fail = any(cf.verdict == "fail" for cf in clause_findings)

@@ -62,20 +62,7 @@ with st.sidebar:
     st.subheader("AI Layer (Gemini)")
     st.caption("Optional — checks each clause against reference texts.")
     use_ai = st.checkbox("Enable AI clause checks (Gemini)", value=False)
-    # Prefer Streamlit secrets for key; fallback to input/env
-    ai_api_key = None
-    try:
-        if "gemini_api_key" in st.secrets:
-            ai_api_key = st.secrets["gemini_api_key"]
-        elif "gemini" in st.secrets and isinstance(st.secrets["gemini"], dict) and "api_key" in st.secrets["gemini"]:
-            ai_api_key = st.secrets["gemini"]["api_key"]
-    except Exception:
-        ai_api_key = None
-
-    if ai_api_key:
-        st.caption("Using Gemini API key from secrets.")
-    else:
-        ai_api_key = st.text_input("Gemini API Key", value=os.environ.get("GEMINI_API_KEY", ""), type="password")
+    ai_api_key = st.text_input("Gemini API Key", value=os.environ.get("GEMINI_API_KEY", ""), type="password")
     ai_csv = st.file_uploader("Upload reference CSV (articles_export.csv)", type=["csv"], key="ai_csv")
     ai_csv_temp_path = None
     if ai_csv is not None:
@@ -219,14 +206,7 @@ if st.button("Run audit now", use_container_width=True):
         ejari_contact=st.session_state.ejari.get("ejari_contact") or None,
     )
 
-    res = ae.run_audit(
-        st.session_state.contract_text or "",
-        ej,
-        rera_index_aed=rera_index_aed,
-        use_ai=use_ai,
-        ai_api_key=ai_api_key,
-        ai_articles_csv_path=ai_csv_temp_path,
-    )
+    res = ae.run_audit(st.session_state.contract_text or "", ej, rera_index_aed=rera_index_aed)
 
     # Header verdict
     if res.verdict == "pass":
