@@ -467,11 +467,6 @@ ILLEGAL_PATTERNS = [
     (re.compile(r"evict.*at any time.*without notice", re.IGNORECASE), "Eviction without statutory notice is not allowed (Law 33/2008).", "fail"),
     (re.compile(r"evict.*without\s+notice", re.IGNORECASE), "Eviction without statutory notice is not allowed (Law 33/2008).", "fail"),
     (re.compile(r"(?i)landlord.*may evict.*for any reason"), "Eviction must meet lawful grounds under Dubai tenancy laws.", "fail"),
-    # Allowing structural/room alterations or partitions
-    (re.compile(r"\b(allow|permit|permitted|may)\b.*\btenant\b.*\b(partitions?|partitioning|sub-?divide|subdivision|erect\s+walls?)\b", re.IGNORECASE),
-     "Clause appears to allow constructing partitions/subdividing rooms; structural modifications require approvals and may breach building regulations.", "fail"),
-    (re.compile(r"\binstall\b.*\bpartitions?\b|\bpartitions?\b.*\binstall\b", re.IGNORECASE),
-     "Installing partitions without approvals may be unlawful; such permissions must be explicit and compliant with building codes.", "fail"),
     # Absolute/sole discretion on rent increases (various phrasings and word orders)
     (re.compile(r"rent.*(increase|adjust).*(landlord(?:'?s)?|landlords?).*(absolute|sole).*(discretion)(?:s)?", re.IGNORECASE),
      "Rent increases cannot be at landlord's sole/absolute discretion; must comply with Decree 43/2013.", "fail"),
