@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import re
 import json
 from typing import Optional, Dict, Any
 
@@ -30,7 +29,7 @@ with st.sidebar:
 
     # Button that tries st.secrets or env vars, else optional file upload
     svc_upload = st.file_uploader("Upload serviceAccount.json (local dev only)", type=["json"], key="svcjson")
-    if st.button("Initialize Firestore", width='stretch'):
+    if st.button("Initialize Firestore", use_container_width=True):
         try:
             if "firebase" in st.secrets:
                 ae.firebase_init_from_mapping(dict(st.secrets["firebase"]))
@@ -54,7 +53,7 @@ with st.sidebar:
     st.caption("Optional CSV with columns like: `city,community,property_type,bedrooms,index_aed`.")
     rera_csv = st.file_uploader("Upload RERA index CSV", type=["csv"], key="rera_csv")
 
-    if st.button("Open official RERA calculator", width='stretch'):
+    if st.button("Open official RERA calculator", use_container_width=True):
         st.markdown(
             "[Dubai Land Department — Rental Index](https://dubailand.gov.ae/en/eservices/rental-index/rental-index/#/)"
         )
@@ -204,7 +203,7 @@ if rera_csv is not None:
 
 # ----------------------------- Run Audit -----------------------------------
 st.markdown("---")
-if st.button("Run audit now", width='stretch'):
+if st.button("Run audit now", use_container_width=True):
     # Build EjariFields back
     ej = ae.EjariFields(
         city=st.session_state.ejari["city"],
@@ -247,44 +246,10 @@ if st.button("Run audit now", width='stretch'):
         "verdict": c.verdict,
         "issues": c.issues,
     } for c in res.clause_findings]
-
-    # Build DataFrame with a separate 'law' column parsed from issues
+    # Wider table and horizontal scroll: wrap in container with overflow CSS
     df = pd.DataFrame(data)
-
-    def _extract_law(s: str) -> str:
-        if not isinstance(s, str) or not s:
-            return ""
-        m = re.search(r"(Law\s+\d+/\d+)", s, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        d = re.search(r"(Decree\s+\d+/\d{4})", s, re.IGNORECASE)
-        if d:
-            return d.group(1)
-        return ""
-
-    if "issues" in df.columns:
-        df["law"] = df["issues"].apply(_extract_law)
-        # Trim issues to keep table readable; full text still visible via dataframe cell expansion
-        df["issues"] = df["issues"].astype(str).apply(lambda t: t if len(t) <= 200 else t[:199] + "…")
-
-    # Reorder columns: clause, verdict, law, text, issues
-    cols_order = [c for c in ["clause", "verdict", "law", "text", "issues"] if c in df.columns]
-    df = df[cols_order]
-
-    # Horizontally scrollable container and tuned column widths
     st.markdown("<div style='overflow-x:auto;'>", unsafe_allow_html=True)
-    st.dataframe(
-        df,
-        width='stretch',
-        hide_index=True,
-        column_config={
-            "clause": st.column_config.NumberColumn("clause", width="small"),
-            "verdict": st.column_config.TextColumn("verdict", width="small"),
-            "law": st.column_config.TextColumn("law", width="small"),
-            "text": st.column_config.TextColumn("text", width="large"),
-            "issues": st.column_config.TextColumn("issues", width="large"),
-        },
-    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### Text findings")

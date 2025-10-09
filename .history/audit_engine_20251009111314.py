@@ -530,24 +530,21 @@ def run_audit(
             articles = read_articles_texts_from_csv(ai_articles_csv_path)
 
         ai_any_fail = False
-        ai_refs_by_clause: Dict[int, List[int]] = {}
         for idx, cf in enumerate(clause_findings):
-            verdict, reason, refs = _gemini_check_clause_against_articles(cf.text, articles, api_key, start_index=0)
+            verdict, reason = _gemini_check_clause_against_articles(cf.text, articles, api_key)
             if verdict == "fail":
                 ai_any_fail = True
-                if refs:
-                    ai_refs_by_clause[idx] = refs
                 # annotate this clause if regex didn't already fail
                 if cf.verdict == "pass":
                     clause_findings[idx] = ClauseFinding(
                         clause_no=cf.clause_no,
                         text=cf.text,
                         verdict="fail",
-                        issues=(cf.issues + "; " if cf.issues else "") + f"AI: {reason}" + (f" | Refs: {refs}" if refs else ""),
+                        issues=(cf.issues + "; " if cf.issues else "") + f"AI: {reason}",
                     )
                 else:
                     # append AI reason
-                    clause_findings[idx].issues = (clause_findings[idx].issues + "; " if clause_findings[idx].issues else "") + f"AI: {reason}" + (f" | Refs: {refs}" if refs else "")
+                    clause_findings[idx].issues = (clause_findings[idx].issues + "; " if clause_findings[idx].issues else "") + f"AI: {reason}"
         if ai_any_fail:
             issues.append("AI layer flagged one or more clauses as non-compliant.")
 

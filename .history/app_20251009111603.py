@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import re
 import json
 from typing import Optional, Dict, Any
 
@@ -247,44 +246,10 @@ if st.button("Run audit now", width='stretch'):
         "verdict": c.verdict,
         "issues": c.issues,
     } for c in res.clause_findings]
-
-    # Build DataFrame with a separate 'law' column parsed from issues
+    # Wider table and horizontal scroll: wrap in container with overflow CSS
     df = pd.DataFrame(data)
-
-    def _extract_law(s: str) -> str:
-        if not isinstance(s, str) or not s:
-            return ""
-        m = re.search(r"(Law\s+\d+/\d+)", s, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        d = re.search(r"(Decree\s+\d+/\d{4})", s, re.IGNORECASE)
-        if d:
-            return d.group(1)
-        return ""
-
-    if "issues" in df.columns:
-        df["law"] = df["issues"].apply(_extract_law)
-        # Trim issues to keep table readable; full text still visible via dataframe cell expansion
-        df["issues"] = df["issues"].astype(str).apply(lambda t: t if len(t) <= 200 else t[:199] + "…")
-
-    # Reorder columns: clause, verdict, law, text, issues
-    cols_order = [c for c in ["clause", "verdict", "law", "text", "issues"] if c in df.columns]
-    df = df[cols_order]
-
-    # Horizontally scrollable container and tuned column widths
     st.markdown("<div style='overflow-x:auto;'>", unsafe_allow_html=True)
-    st.dataframe(
-        df,
-        width='stretch',
-        hide_index=True,
-        column_config={
-            "clause": st.column_config.NumberColumn("clause", width="small"),
-            "verdict": st.column_config.TextColumn("verdict", width="small"),
-            "law": st.column_config.TextColumn("law", width="small"),
-            "text": st.column_config.TextColumn("text", width="large"),
-            "issues": st.column_config.TextColumn("issues", width="large"),
-        },
-    )
+    st.dataframe(df, width='stretch', hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### Text findings")
