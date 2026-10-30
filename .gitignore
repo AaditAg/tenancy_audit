@@ -1,28 +1,25 @@
-cat > .gitignore <<'EOF'
 # macOS
 .DS_Store
 
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.python-version
-
-# Virtual env
 .venv/
 venv/
+.pytest_cache/
 
-# Streamlit cache & logs
+# Streamlit
 .streamlit/cache/
 .streamlit/logs/
-
-# Local secrets (DO NOT COMMIT)
 .streamlit/secrets.toml
 
+# Secrets - never commit
+serviceAccount*.json
+*.env
+.env
+
+# Editor history
+.history/
+
 # Misc
-*.pdf
-*.html
-EOF
-serviceAccountKeypee.json
 *.pdf
