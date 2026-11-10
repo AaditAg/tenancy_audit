@@ -1,0 +1,25 @@
+Ejari Tenancy Contract
+Property Usage: Residential
+Landlord Name: Example Holdings LLC
+Tenant Name: Jane Doe
+Property Type: Apartment
+Location: Dubai Marina
+Bedrooms: 2
+Contract Period: From 01/03/2025 To 28/02/2026
+Annual Rent: AED 110,000
+Security Deposit Amount: AED 11,000
+Ejari Contract No: 1234567890
+
+Terms & Conditions
+1. The Tenant shall pay the annual rent in four post-dated cheques delivered on signing.
+2. The Landlord may increase the rent at any time at the Landlord's sole discretion.
+3. The Landlord may evict the Tenant at any time without notice for any reason.
+4. The security deposit is non-refundable and shall be forfeited on termination.
+5. The Tenant is permitted to install partitions and sub-divide the rooms to accommodate additional occupants.
+6. The Tenant shall be responsible for all maintenance and repairs, including structural and major repairs.
+7. In case of late payment the Tenant shall pay a penalty of 25% of the annual rent.
+8. The rent is exclusive of 5% VAT, payable by the Tenant on each instalment.
+9. The Landlord may enter the unit at any time without prior notice.
+10. This contract is governed by the laws of England and the courts of London shall have jurisdiction.
+11. The Tenant must vacate within 15 days if the Landlord decides to sell the property.
+12. The Landlord shall hand over the unit in good condition and the Tenant shall use it for residential purposes only.
