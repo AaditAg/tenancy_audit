@@ -63,6 +63,24 @@ Open the sidebar (⚙️) to choose a model and paste a key, or set an environme
 
 You can also set `[llm] api_key` in `.streamlit/secrets.toml`. Model ids and base URLs change often, so confirm them in your provider's console and edit them under *Endpoint (advanced)*.
 
+### Deploying without end-user keys (managed mode)
+
+If you configure a key on the server, visitors never see or enter one: the AI review just runs. For Streamlit Cloud, add this under *App settings → Secrets* (locally, use `.streamlit/secrets.toml`, which is git-ignored):
+
+```toml
+[llm]
+api_key  = "your-key"
+provider = "gpt-oss-groq"   # optional; any preset id from llm_client.py
+# base_url = "..."          # optional overrides
+# model    = "..."
+
+[limits]                    # optional, protects your quota
+per_session_per_hour = 3    # AI audits per visitor
+global_per_hour      = 100  # AI audits across all visitors (0 = unlimited)
+```
+
+Environment variables work too (`GROQ_API_KEY`, `AI_PER_SESSION_PER_HOUR`, `AI_GLOBAL_PER_HOUR`). Over the limit, the audit still completes using the built-in rules and tells the user the AI review is busy. Limits are in-memory per server process, so also set a spending cap with your provider. For zero per-token cost and full privacy, self-host a model and point `base_url` at it.
+
 **Guardrails:** citations not present in the retrieved excerpts are dropped, and AI-only findings are capped at "worth negotiating" unless backed by a cited reference.
 
 ## How it works

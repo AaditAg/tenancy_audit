@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import urllib.parse
+import uuid
 from datetime import date
 from html import escape
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,7 @@ os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
 import audit_engine as ae
 import legal_kb
+from ratelimit import RateLimiter
 from llm_client import DEFAULT_PROVIDER, PROVIDERS, LLMClient, LLMError
 from translations import (LANG_NATIVE, LANGS, RTL, SPEECH_CODE, check_text, emirate_name, rule_title, t)
 
@@ -181,13 +183,48 @@ def _articles(path: str) -> List[str]:
 
 
 # ----------------------------- sidebar: advanced ---------------------------
+@st.cache_resource
+def _limiter() -> RateLimiter:
+    """One limiter per server process, shared by all sessions. Tune via secrets [limits] or env vars."""
+    def n(secret: str, env: str, default: int) -> int:
+        try:
+            return int(_secret("limits", secret) or os.environ.get(env, default))
+        except ValueError:
+            return default
+    return RateLimiter(per_client=n("per_session_per_hour", "AI_PER_SESSION_PER_HOUR", 3),
+                       global_limit=n("global_per_hour", "AI_GLOBAL_PER_HOUR", 100))
+
+
+def _managed_client() -> Optional[LLMClient]:
+    """Server-side key mode: if the deployer configured a key (secrets [llm] or env var), end users never see or enter one."""
+    pkey = _secret("llm", "provider") or DEFAULT_PROVIDER
+    if pkey not in PROVIDERS:
+        return None
+    prov = PROVIDERS[pkey]
+    key = _secret("llm", "api_key") or os.environ.get(prov.key_env, "")
+    if prov.needs_key and not key:
+        return None
+    try:
+        return LLMClient.from_provider(pkey, api_key=key, base_url=_secret("llm", "base_url") or "",
+                                       model=_secret("llm", "model") or "")
+    except LLMError:
+        return None
+
+
+ss.setdefault("client_id", uuid.uuid4().hex)
 llm_client: Optional[LLMClient] = None
 use_articles = False
+managed_client = _managed_client()
 with st.sidebar:
     st.header("⚙️ " + T("settings"))
     default_key = _secret("llm", "api_key") or os.environ.get(PROVIDERS[DEFAULT_PROVIDER].key_env, "")
-    use_ai = st.toggle("AI", value=bool(default_key),
-                       help="An open-source model (Kimi K3 / Llama / gpt-oss / Qwen / local) reviews each clause.")
+    if managed_client is not None:
+        llm_client = managed_client
+        st.caption("🤖 AI review is provided by this service. No key needed.")
+        use_ai = False
+    else:
+        use_ai = st.toggle("AI", value=bool(default_key),
+                           help="An open-source model (Kimi K3 / Llama / gpt-oss / Qwen / local) reviews each clause.")
     if use_ai:
         pkey = st.selectbox("Model", list(PROVIDERS), index=list(PROVIDERS).index(DEFAULT_PROVIDER),
                             format_func=lambda k: PROVIDERS[k].label)
@@ -396,9 +433,15 @@ def run_audit_now() -> None:
         contract_language=ae.detect_language(ss.contract_text),
     )
     index = (int(ss.f_index) or None) if (inc and ss.f_jurisdiction == "dubai") else None
-    articles = _articles(str(HERE / "articles_export.csv")) if (llm_client and use_articles) else None
+    # Managed (server-key) mode: cap AI use per visitor and overall; over the cap the audit still runs on rules alone.
+    ss.ai_ok = True
+    ss.ai_blocked = False
+    if managed_client is not None and not _limiter().allow(ss.client_id):
+        ss.ai_ok, ss.ai_blocked = False, True
+    audit_llm = llm_client if ss.ai_ok else None
+    articles = _articles(str(HERE / "articles_export.csv")) if (audit_llm and use_articles) else None
     bar = st.progress(0.0, text=T("checking"))
-    ss.result = ae.run_audit(ss.contract_text, ej, rera_index_aed=index, llm=llm_client, ai_articles=articles,
+    ss.result = ae.run_audit(ss.contract_text, ej, rera_index_aed=index, llm=audit_llm, ai_articles=articles,
                              progress=lambda f, m: bar.progress(min(max(f, 0.0), 1.0), text=T("checking")))
     bar.empty()
     ss.show_all = False
@@ -414,7 +457,7 @@ def run_audit_now() -> None:
 # ----------------------------- results --------------------------------------
 def translations_for(res: ae.AuditResult) -> Dict[str, str]:
     """AI-translated explanations (cached per result+language). Empty when English or no model."""
-    if ss.lang == "en" or llm_client is None:
+    if ss.lang == "en" or llm_client is None or not ss.get("ai_ok", True):
         return {}
     key = (res.timestamp, ss.lang)
     if key in ss.tr_cache:
@@ -464,6 +507,8 @@ def screen_result() -> None:
     lang_bar()
     steps(2)
     tr = translations_for(res)
+    if ss.get("ai_blocked"):
+        st.info("AI review is busy right now (usage limit reached), so this result uses the built-in rules only.")
 
     fails = [c for c in res.clause_findings if c.verdict == "fail"] + [c for c in res.checks if c.status == "fail"]
     warns = [c for c in res.clause_findings if c.verdict == "warn"] + [c for c in res.checks if c.status == "warn"]
